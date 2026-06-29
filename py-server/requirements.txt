@@ -1,0 +1,28 @@
+# Smart City Video Analytics — Python Dependencies
+# Install:  pip install -r requirements.txt
+
+# ── Web Server ────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9       # required for FastAPI file uploads
+
+# ── Core ML ───────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ── Computer Vision ───────────────────────────────────
+opencv-python>=4.8.0
+
+# ── Vehicle Detection (YOLOv8) ────────────────────────
+ultralytics>=8.0.0
+
+# ── Face Recognition (InsightFace) ────────────────────
+insightface>=0.7.3
+onnxruntime>=1.16.0           # use onnxruntime-gpu if you have NVIDIA GPU
+scipy>=1.10.0                 # required by insightface
+scikit-image>=0.20.0          # required by insightface
+
+# ── Stream / Kafka (optional) ─────────────────────────
+# kafka-python>=2.0.2         # uncomment if using Kafka stream integration
