@@ -47,7 +47,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -61,6 +61,9 @@ pipeline: Optional[SmartCityPipeline] = None
 
 event_buffer : deque[dict] = deque(maxlen=500)
 alert_buffer : deque[dict] = deque(maxlen=200)
+
+# Active WebSocket clients — push updates to all of them
+_ws_clients: set[WebSocket] = set()
 
 stream_state = {
     "running":     False,
@@ -149,6 +152,8 @@ def _store(event: FrameEvent):
     event_buffer.append(d)
     for alert in event.alerts:
         alert_buffer.append(alert)
+    # Broadcast latest state to all connected WebSocket clients
+    asyncio.ensure_future(_broadcast_update())
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
@@ -463,7 +468,7 @@ async def _stream_worker(source: str, camera_id: str):
     stream_state["frame_count"] = 0
     pipeline.camera_id = camera_id
 
-    PROCESS_EVERY_N = 1000  # only run inference every 3rd frame, tune as needed
+    PROCESS_EVERY_N = 3  # only run inference every 3rd frame, tune as needed
 
     try:
         frame_idx = 0
@@ -720,6 +725,83 @@ async def watchlist_list():
     """List all persons currently on the watchlist."""
     people = pipeline.watchlist.list_people()
     return {"total": len(people), "people": people}
+
+
+# ─── WebSocket ───────────────────────────────────────────────────────────────
+
+async def _broadcast_update():
+    """
+    Build the current snapshot and push it to every connected WS client.
+    Dead connections are silently pruned.
+    """
+    if not _ws_clients:
+        return
+    snapshot = _ws_snapshot()
+    dead: set[WebSocket] = set()
+    for ws in list(_ws_clients):
+        try:
+            await ws.send_json(snapshot)
+        except Exception:
+            dead.add(ws)
+    _ws_clients.difference_update(dead)
+
+
+def _ws_snapshot() -> dict:
+    """Assemble the current state payload sent over WebSocket."""
+    latest_event = event_buffer[-1] if event_buffer else None
+    alerts = list(alert_buffer)
+    return {
+        "stream_status": {
+            "running":          stream_state["running"],
+            "source":           stream_state["source"],
+            "camera_id":        stream_state["camera_id"],
+            "started_at":       stream_state["started_at"],
+            "frames_processed": stream_state["frame_count"],
+            "error":            stream_state["error"],
+        },
+        "latest_event": latest_event,
+        "alerts":       alerts,
+    }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    """
+    WebSocket endpoint — ws://localhost:8000/ws
+
+    Pushes a JSON snapshot every 500 ms and immediately after each new
+    processed frame so the frontend stays in sync without polling.
+
+    Message schema:
+    {
+      "stream_status": { running, source, camera_id, frames_processed, error },
+      "latest_event":  FrameEvent | null,
+      "alerts":        AlertEvent[]
+    }
+    """
+    await ws.accept()
+    _ws_clients.add(ws)
+    # Send the current state immediately on connect
+    try:
+        await ws.send_json(_ws_snapshot())
+    except Exception:
+        _ws_clients.discard(ws)
+        return
+
+    try:
+        # Keep the connection alive; also push a heartbeat every 500 ms so
+        # the client always sees up-to-date stream_status even when no new
+        # frames are being processed.
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                await ws.send_json(_ws_snapshot())
+            except Exception:
+                break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _ws_clients.discard(ws)
 
 
 # ─── Events & Alerts ──────────────────────────────────────────────────────────

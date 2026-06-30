@@ -87,13 +87,13 @@ export const removeFromWatchlist = (person_id: string) =>
   api.delete(`/watchlist/${person_id}`).then((r) => r.data);
 
 export const getWatchlist = () =>
-  api.get<WatchlistPerson[]>("/watchlist").then((r) => r.data);
+  api.get<{ total: number; people: WatchlistPerson[] }>("/watchlist").then((r) => r.data.people);
 
 // ── Events & Alerts ───────────────────────────────────────────────
 export const getEvents = (limit = 50) =>
-  api.get<FrameEvent[]>(`/events?limit=${limit}`).then((r) => r.data);
+  api.get<{ total: number; events: FrameEvent[] }>(`/events?limit=${limit}`).then((r) => r.data.events);
 
 export const getAlerts = (limit = 100) =>
-  api.get<AlertEvent[]>(`/alerts?limit=${limit}`).then((r) => r.data);
+  api.get<{ total: number; alerts: AlertEvent[] }>(`/alerts?limit=${limit}`).then((r) => r.data.alerts);
 
 export const clearBuffers = () => api.delete("/events").then((r) => r.data);

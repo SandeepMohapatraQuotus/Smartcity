@@ -1,44 +1,43 @@
+/**
+ * useEventStream — backed by WebSocket.
+ * Keeps an in-memory rolling buffer of the last `limit` events received
+ * over the WebSocket so existing consumers (events page, dashboard) don't
+ * need to change their API.
+ */
 import { useEffect, useRef, useState } from "react";
-import { getEvents } from "@/api/endpoints";
+import { useWebSocket } from "./useWebSocket";
 import type { FrameEvent } from "@/api/types";
-import { POLL_EVENTS_MS } from "@/lib/constants";
 
 interface Options {
   enabled: boolean;
   limit?: number;
+  /** @deprecated – no longer used; kept for API compat */
   interval?: number;
 }
 
-export function useEventStream({
-  enabled,
-  limit = 50,
-  interval = POLL_EVENTS_MS,
-}: Options) {
+export function useEventStream({ enabled, limit = 50 }: Options) {
+  const { latestEvent } = useWebSocket(enabled);
   const [events, setEvents] = useState<FrameEvent[]>([]);
-  const mounted = useRef(true);
+  const lastIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    mounted.current = true;
-    if (!enabled) return;
-    let timer: ReturnType<typeof setTimeout>;
+    if (!latestEvent) return;
+    // Deduplicate: only push when frame_id changes
+    if (latestEvent.frame_id === lastIdRef.current) return;
+    lastIdRef.current = latestEvent.frame_id;
+    setEvents((prev) => {
+      const next = [...prev, latestEvent];
+      return next.length > limit ? next.slice(next.length - limit) : next;
+    });
+  }, [latestEvent, limit]);
 
-    const poll = async () => {
-      try {
-        const res = await getEvents(limit);
-        if (mounted.current) setEvents(res);
-      } catch {
-        /* keep last good data */
-      } finally {
-        if (mounted.current) timer = setTimeout(poll, interval);
-      }
-    };
-    poll();
-
-    return () => {
-      mounted.current = false;
-      clearTimeout(timer);
-    };
-  }, [enabled, limit, interval]);
+  // Reset buffer when disabled
+  useEffect(() => {
+    if (!enabled) {
+      setEvents([]);
+      lastIdRef.current = null;
+    }
+  }, [enabled]);
 
   const latest = events.length ? events[events.length - 1] : null;
   return { events, latest };

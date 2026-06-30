@@ -1,39 +1,23 @@
-import { useEffect, useRef, useState } from "react";
-import { getStreamStatus } from "@/api/endpoints";
+/**
+ * useStreamStatus — backed by WebSocket (falls back to polling when WS is
+ * not yet connected).
+ */
+import { useWebSocket } from "./useWebSocket";
 import type { StreamStatus } from "@/api/types";
-import { POLL_STREAM_MS } from "@/lib/constants";
 
 interface Options {
   enabled: boolean;
-  interval?: number;
 }
 
-export function useStreamStatus({ enabled, interval = POLL_STREAM_MS }: Options) {
-  const [status, setStatus] = useState<StreamStatus | null>(null);
-  const mounted = useRef(true);
-
-  useEffect(() => {
-    mounted.current = true;
-    if (!enabled) return;
-    let timer: ReturnType<typeof setTimeout>;
-
-    const poll = async () => {
-      try {
-        const res = await getStreamStatus();
-        if (mounted.current) setStatus(res);
-      } catch {
-        if (mounted.current) setStatus(null);
-      } finally {
-        if (mounted.current) timer = setTimeout(poll, interval);
-      }
-    };
-    poll();
-
-    return () => {
-      mounted.current = false;
-      clearTimeout(timer);
-    };
-  }, [enabled, interval]);
-
-  return { status, isLive: !!status?.running };
+export function useStreamStatus({ enabled }: Options): {
+  status: StreamStatus | null;
+  isLive: boolean;
+  wsConnected: boolean;
+} {
+  const { streamStatus, connected } = useWebSocket(enabled);
+  return {
+    status: streamStatus,
+    isLive: !!streamStatus?.running,
+    wsConnected: connected,
+  };
 }

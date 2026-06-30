@@ -54,11 +54,8 @@ function Watchlist() {
 
   const load = async () => {
     try {
-      const proples=await getWatchlist();
-      if(!proples) (
-        toast.error("failed to fetah watchlist")
-      )
-      setPeople(proples);
+      const people = await getWatchlist();
+      setPeople(people ?? []);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to load watchlist");
     }

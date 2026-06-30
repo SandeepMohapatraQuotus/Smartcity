@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Sun, Moon, Car, User, ScanText, ScanFace, Siren } from "lucide-react";
+import { Sun, Moon, Car, User, ScanText, ScanFace, Siren, Wifi, WifiOff } from "lucide-react";
 import { toast } from "sonner";
 import { PageWrapper } from "@/components/layout/PageHeader";
 import { MotionCard } from "@/components/shared/MotionCard";
@@ -54,7 +54,7 @@ function Dashboard() {
   const [source, setSource] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const { status, isLive } = useStreamStatus({ enabled: true });
+  const { status, isLive, wsConnected } = useStreamStatus({ enabled: true });
   const { latest } = useEventStream({ enabled: isLive, limit: 1 });
   const { alerts } = useAlertStream({ enabled: isLive });
 
@@ -124,6 +124,23 @@ function Dashboard() {
                   Stop
                 </Button>
                 <StatusBadge status={isLive ? "live" : "offline"} />
+                {/* WebSocket connection indicator */}
+                <span
+                  title={wsConnected ? "WebSocket connected" : "WebSocket disconnected"}
+                  className={cn(
+                    "flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold",
+                    wsConnected
+                      ? "bg-emerald-500/15 text-emerald-400"
+                      : "bg-red-500/15 text-red-400",
+                  )}
+                >
+                  {wsConnected ? (
+                    <Wifi className="h-3.5 w-3.5" />
+                  ) : (
+                    <WifiOff className="h-3.5 w-3.5" />
+                  )}
+                  WS
+                </span>
               </div>
             </div>
             {status?.error && (

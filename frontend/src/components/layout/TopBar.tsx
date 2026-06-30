@@ -2,11 +2,14 @@ import { useEffect, useState } from "react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge } from "@/components/shared/StatusBadge";
-import { useServerStatus } from "@/hooks/useServerStatus";
+import { useWebSocket } from "@/hooks/useWebSocket";
 import { DEFAULT_CAMERA_ID } from "@/lib/constants";
 
 export function TopBar() {
-  const { online, data } = useServerStatus();
+  // Derive server online state from the shared WebSocket connection.
+  // No additional HTTP polling needed — the WS heartbeat already tells us
+  // if the server is reachable.
+  const { connected } = useWebSocket(true);
   const [clock, setClock] = useState("");
 
   useEffect(() => {
@@ -26,7 +29,7 @@ export function TopBar() {
       </span>
       <div className="ml-auto flex items-center gap-3">
         <StatusBadge
-          status={online ? (data?.status === "ready" ? "live" : "loading") : "offline"}
+          status={connected ? "live" : "offline"}
         />
         <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
           {DEFAULT_CAMERA_ID}
