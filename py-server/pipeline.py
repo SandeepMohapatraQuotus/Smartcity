@@ -171,6 +171,7 @@ class SmartCityPipeline:
             frame_id  = frame_id,
             camera_id = self.camera_id,
         )
+        vehicle_boxes  = [d.bbox for d in vehicle_result.detections]
 
         # 5. ANPR — number plate reading
         anpr_result = self.anpr.read_plates(

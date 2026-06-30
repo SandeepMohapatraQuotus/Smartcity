@@ -65,7 +65,67 @@ class ANPRResult:
             "plates":     [p.to_dict() for p in self.plates],
         }
 
+def read_plates_in_vehicles(
+    self,
+    frame              : np.ndarray,
+    vehicle_boxes      : list,   # list of [x1, y1, x2, y2] from VehicleDetector
+    frame_id           : str = "frame_0",
+    camera_id          : str = "cam_0",
+) -> ANPRResult:
+    """
+    Run plate localisation + OCR only within given vehicle bounding boxes,
+    instead of scanning the entire frame. Dramatically reduces false
+    positives from background clutter (signs, trim, etc.).
+    """
+    plates = []
 
+    for vbox in vehicle_boxes:
+        vx1, vy1, vx2, vy2 = vbox
+        vx1, vy1 = max(0, vx1), max(0, vy1)
+        vx2, vy2 = min(frame.shape[1], vx2), min(frame.shape[0], vy2)
+        if vx2 <= vx1 or vy2 <= vy1:
+            continue
+
+        # Plates are almost always in the lower half of a vehicle's bbox —
+        # narrowing further improves the contour heuristic's precision.
+        veh_h = vy2 - vy1
+        crop_y1 = vy1 + int(veh_h * 0.4)
+        vehicle_crop = frame[crop_y1:vy2, vx1:vx2]
+        if vehicle_crop.size == 0:
+            continue
+
+        # Run existing contour localisation, but only within this small crop
+        local_rois = self._contour_localise(vehicle_crop)
+
+        for lx1, ly1, lx2, ly2 in local_rois:
+            # Translate crop-local coords back to full-frame coords
+            fx1, fy1 = vx1 + lx1, crop_y1 + ly1
+            fx2, fy2 = vx1 + lx2, crop_y1 + ly2
+
+            roi = frame[fy1:fy2, fx1:fx2]
+            if roi.size == 0:
+                continue
+            processed = _preprocess_roi(roi)
+            readings = self._ocr(processed)
+            if not readings:
+                continue
+
+            combined_text = " ".join(text for text, conf in readings)
+            avg_conf = sum(conf for _, conf in readings) / len(readings)
+            cleaned = _clean_plate(combined_text)
+            if len(cleaned) < 4 or avg_conf < self.min_confidence:
+                continue
+
+            plates.append(PlateReading(
+                bbox=[fx1, fy1, fx2, fy2],
+                raw_text=combined_text.strip(),
+                cleaned_text=cleaned,
+                confidence=avg_conf,
+                frame_id=frame_id,
+            ))
+
+    plates = _deduplicate_plates(plates)
+    return ANPRResult(frame_id=frame_id, camera_id=camera_id, plates=plates, ocr_engine=self._ocr_name)
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _clean_plate(text: str) -> str:
@@ -84,7 +144,32 @@ def _preprocess_roi(roi: np.ndarray) -> np.ndarray:
     _, th = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return th
 
+def _deduplicate_plates(plates: list[PlateReading], iou_thresh: float = 0.3) -> list[PlateReading]:
+    """Remove overlapping duplicate detections, keeping the highest-confidence one."""
+    if not plates:
+        return plates
+    plates = sorted(plates, key=lambda p: p.confidence, reverse=True)
+    keep = []
+    for p in plates:
+        is_dup = False
+        for k in keep:
+            if _iou(p.bbox, k.bbox) > iou_thresh:
+                is_dup = True
+                break
+        if not is_dup:
+            keep.append(p)
+    return keep
 
+def _iou(box_a: list[int], box_b: list[int]) -> float:
+    xa1, ya1, xa2, ya2 = box_a
+    xb1, yb1, xb2, yb2 = box_b
+    inter_x1, inter_y1 = max(xa1, xb1), max(ya1, yb1)
+    inter_x2, inter_y2 = min(xa2, xb2), min(ya2, yb2)
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+    area_a = (xa2 - xa1) * (ya2 - ya1)
+    area_b = (xb2 - xb1) * (yb2 - yb1)
+    union = area_a + area_b - inter_area
+    return inter_area / union if union > 0 else 0.0
 # ─── ANPR Service ─────────────────────────────────────────────────────────────
 
 class ANPRService:
@@ -102,7 +187,7 @@ class ANPRService:
     def __init__(
         self,
         plate_model_path : Optional[str] = None,
-        min_confidence   : float         = 0.3,
+        min_confidence   : float         = 0.10,
         languages        : list[str]     = None,
         device           : str           = "auto",
     ):
@@ -123,55 +208,49 @@ class ANPRService:
         # Stage 2 — OCR
         self._load_ocr()
 
+
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def read_plates(
-        self,
-        frame     : np.ndarray,
-        frame_id  : str = "frame_0",
-        camera_id : str = "cam_0",
-    ) -> ANPRResult:
-        """
-        Detect and read all number plates in a BGR frame.
-
-        Steps:
-          1. Localise plate regions  (YOLO or contour fallback)
-          2. For each ROI: preprocess → OCR → clean text
-          3. Filter by min_confidence
-        """
-        rois   = self._localise(frame)
+    def read_plates(self, frame, frame_id="frame_0", camera_id="cam_0") -> ANPRResult:
+        rois = self._localise(frame)
         plates = []
 
         for bbox in rois:
             x1, y1, x2, y2 = bbox
-            # Guard against out-of-bounds crops
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            roi       = frame[y1:y2, x1:x2]
+            roi = frame[y1:y2, x1:x2]
             processed = _preprocess_roi(roi)
-            readings  = self._ocr(processed)
+            readings = self._ocr(processed)
 
-            for raw_text, conf in readings:
-                cleaned = _clean_plate(raw_text)
-                if len(cleaned) < 4 or conf < self.min_confidence:
-                    continue
-                plates.append(PlateReading(
-                    bbox         = [x1, y1, x2, y2],
-                    raw_text     = raw_text.strip(),
-                    cleaned_text = cleaned,
-                    confidence   = conf,
-                    frame_id     = frame_id,
-                ))
+            if not readings:
+                continue
 
-        return ANPRResult(
-            frame_id   = frame_id,
-            camera_id  = camera_id,
-            plates     = plates,
-            ocr_engine = self._ocr_name,
-        )
+            # Combine all text fragments found within this single plate region
+            # into one string (left-to-right order is preserved by EasyOCR's
+            # default reading order), and average their confidences.
+            combined_text = " ".join(text for text, conf in readings)
+            avg_conf = sum(conf for _, conf in readings) / len(readings)
+
+            cleaned = _clean_plate(combined_text)
+            if len(cleaned) < 4 or avg_conf < self.min_confidence:
+                continue
+
+            plates.append(PlateReading(
+                bbox=[x1, y1, x2, y2],
+                raw_text=combined_text.strip(),
+                cleaned_text=cleaned,
+                confidence=avg_conf,
+                frame_id=frame_id,
+            ))
+
+        plates = _deduplicate_plates(plates)  # from earlier fix
+        return ANPRResult(frame_id=frame_id, camera_id=camera_id, plates=plates, ocr_engine=self._ocr_name)
+
+
 
     def draw(self, frame: np.ndarray, result: ANPRResult) -> np.ndarray:
         """Draw plate bounding boxes and recognised text on the frame."""
@@ -217,14 +296,7 @@ class ANPRService:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 boxes.append([x1, y1, x2, y2])
         return boxes
-
     def _contour_localise(self, frame: np.ndarray) -> list[list[int]]:
-        """
-        Heuristic plate localisation using edge detection + contour filtering.
-
-        Looks for rectangular regions with plate-like aspect ratio (2:1 to 5:1)
-        and area between 0.05% and 5% of the frame.
-        """
         h, w   = frame.shape[:2]
         gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur   = cv2.bilateralFilter(gray, 11, 17, 17)
@@ -246,18 +318,16 @@ class ANPRService:
             x, y, cw, ch = cv2.boundingRect(approx)
             area          = cw * ch
 
-            # filter by area  (0.05% – 5% of frame)
-            if not (0.0005 * frame_area < area < 0.05 * frame_area):
+            # filter by area  (0.05% – 40% of frame)  ← widened from 5% to handle close-up shots
+            if not (0.0005 * frame_area < area < 0.40 * frame_area):
                 continue
 
-            # filter by aspect ratio  (plate-like: width > height, ratio 1.5–6)
             if ch == 0:
                 continue
             ratio = cw / ch
             if not (1.5 < ratio < 6.0):
                 continue
 
-            # small padding
             pad = 4
             candidates.append([
                 max(0, x - pad), max(0, y - pad),
@@ -265,7 +335,6 @@ class ANPRService:
             ])
 
         return candidates
-
     # ── Stage 2: OCR ─────────────────────────────────────────────────────────
 
     def _load_ocr(self):

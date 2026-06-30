@@ -169,6 +169,7 @@ class DehazingService:
         gamma        : float = 0.85,
         sharpen      : float = 0.6,
         msrcr_thresh : float = 0.72,
+        clear_thresh : float = 0.08
     ):
         self.patch_size   = patch_size
         self.omega        = omega
@@ -176,26 +177,36 @@ class DehazingService:
         self.gamma        = gamma
         self.sharpen      = sharpen
         self.msrcr_thresh = msrcr_thresh
+        self.clear_thresh = clear_thresh
         print(f"[Dehazing] Improved DCP+MSRCR service ready")
 
     # ── Public API ────────────────────────────────────────────────────────────
-
+    def _estimate_haze_density(self, dark: np.ndarray, sky_mask: np.ndarray) -> float:
+        """Mean dark-channel value over non-sky pixels; near 0 = clear, higher = hazy."""
+        non_sky = ~sky_mask
+        if non_sky.sum() == 0:
+            return 0.0
+        return float(dark[non_sky].mean())
     def dehaze(self, frame: np.ndarray) -> DehazingResult:
-        """
-        Dehaze a BGR frame. Automatically picks DCP or MSRCR.
-
-        Args:
-            frame : BGR uint8 numpy array
-
-        Returns:
-            DehazingResult  (dehazed_frame + metadata)
-        """
-        img  = frame.astype(np.float32) / 255.0
+        img = frame.astype(np.float32) / 255.0
         mean_brightness = float(img.mean())
+
+        # Compute dark channel + sky mask up front so we can gate on haze density
+        dark = self._dark_channel(img)
+        sky_mask = self._detect_sky(img, dark)
+        haze_density = self._estimate_haze_density(dark, sky_mask)
+
+        # Image is already clear — skip correction (or apply a very light touch)
+        if haze_density < self.clear_thresh:
+            return DehazingResult(
+                dehazed_frame = frame.copy(),
+                transmission  = np.ones(frame.shape[:2], np.float32),
+                atm_light     = mean_brightness,
+                method        = "none",
+            )
 
         # Auto-select algorithm
         if mean_brightness > self.msrcr_thresh:
-            # Very bright / sky-dominant → use MSRCR
             dehazed = _msrcr(frame)
             dehazed = _contrast_stretch(dehazed)
             dehazed = _unsharp_mask(dehazed, self.sharpen)
@@ -207,11 +218,12 @@ class DehazingService:
             )
 
         # Standard: Sky-Aware DCP + post-processing
-        return self._dcp_pipeline(frame, img)
+        # pass dark/sky_mask through so _dcp_pipeline doesn't recompute them
+        return self._dcp_pipeline(frame, img, dark, sky_mask)
 
     # ── DCP Pipeline ──────────────────────────────────────────────────────────
 
-    def _dcp_pipeline(self, frame: np.ndarray, img: np.ndarray) -> DehazingResult:
+    def _dcp_pipeline(self, frame: np.ndarray, img: np.ndarray, dark: np.ndarray, sky_mask: np.ndarray) -> DehazingResult:
         # 1. Dark channel
         dark = self._dark_channel(img)
 
@@ -256,14 +268,11 @@ class DehazingService:
         return cv2.erode(min_channel, kernel)
 
     def _detect_sky(self, img: np.ndarray, dark: np.ndarray) -> np.ndarray:
-        """
-        Identify sky / bright regions where DCP tends to fail.
-        A pixel is 'sky' if it is both bright and has a very low dark channel value.
-        """
-        brightness = img.max(axis=2)                  # V channel equivalent
+        brightness = img.max(axis=2)
         saturation = (img.max(axis=2) - img.min(axis=2)) / (img.max(axis=2) + 1e-6)
-        sky_mask   = (brightness > 0.75) & (saturation < 0.25) & (dark < 0.15)
-        # Morphological closing to fill gaps in sky mask
+        # blue channel dominance catches clear blue sky; low saturation catches hazy/grey sky
+        blue_dominant = (img[:, :, 0] > img[:, :, 2]) & (img[:, :, 0] > 0.4)  # BGR: channel 0 = blue
+        sky_mask = (brightness > 0.6) & ((saturation < 0.25) | blue_dominant) & (dark < 0.2)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
         sky_mask = cv2.morphologyEx(sky_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
         return sky_mask

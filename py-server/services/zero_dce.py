@@ -80,8 +80,8 @@ class ZeroDCEEnhancer:
     def __init__(
         self,
         weights_path : str = _WEIGHTS,
-        scale_factor : int = 1,
-        device       : str = "auto",
+        scale_factor : int = 12,
+        device       : str = "cpu",
     ):
         self.scale_factor = scale_factor
         self.device       = self._resolve_device(device)

@@ -194,7 +194,7 @@ async def analyse_frame(
     """
     frame = _decode_bytes(await file.read())
     pipeline.camera_id = camera_id
-    event = await pipeline.process_frame_async(frame)  # ← was process_frame
+    event = await asyncio.to_thread(pipeline.process_frame, frame)
     _store(event)
     return JSONResponse(content=_serialise(event))
 
@@ -463,7 +463,7 @@ async def _stream_worker(source: str, camera_id: str):
     stream_state["frame_count"] = 0
     pipeline.camera_id = camera_id
 
-    PROCESS_EVERY_N = 3  # only run inference every 3rd frame, tune as needed
+    PROCESS_EVERY_N = 1000  # only run inference every 3rd frame, tune as needed
 
     try:
         frame_idx = 0
