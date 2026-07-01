@@ -1,29 +1,9 @@
-"""
-Smart City Pipeline
---------------------
-Path : py-server/pipeline.py
 
-Orchestrates all three classifiers in order:
-
-  BGR Frame
-      │
-      ▼
-  DayNightClassifier  ──night──▶  enhance_night_frame()
-      │ day / enhanced                    │
-      └──────────────────────────────────┘
-                        │
-             ┌──────────┴──────────┐
-             ▼                     ▼
-     VehicleDetector        FaceRecogniser
-             │                     │
-             └──────────┬──────────┘
-                        ▼
-                  FrameEvent  (pushed to Kafka / DB / API response)
-"""
 
 import cv2
 import time
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -90,9 +70,26 @@ class SmartCityPipeline:
         day_night_weights   : Optional[str] = None,
         watchlist_path      : Optional[str] = None,
         face_sim_threshold  : float = 0.55,
+        # ── Performance knobs ──────────────────────────────────────────────────
+        anpr_interval       : int   = 5,     # run ANPR every N frames (0 = every frame)
+        inference_max_side  : int   = 960,   # resize longer edge to this before inference
+                                             # (0 = disabled, use original resolution)
+        face_det_size       : int   = 320,   # InsightFace detection grid (320 or 640)
+        n_threads           : int   = 4,     # parallel inference workers
+        # ── ANPR knobs  ← NEW ────────────────────────────────────────────────
+        plate_model_path    : Optional[str] = None,   # path to YOLOv8 plate-detection .pt
+                                                        # (None → falls back to contour heuristic)
+        anpr_min_confidence : float = 0.10,
     ):
         self.camera_id = camera_id
         self._frame_idx = 0
+
+        # ANPR throttle state
+        self._anpr_interval    = anpr_interval
+        self._last_anpr_result : Optional[ANPRResult] = None
+
+        # Frame downscale cap (0 = off)
+        self._inference_max_side = inference_max_side
 
         print("[Pipeline] Loading Day/Night Classifier ...")
         self.day_night = DayNightClassifier(model_path=day_night_weights)
@@ -104,7 +101,10 @@ class SmartCityPipeline:
         )
 
         print("[Pipeline] Loading Face Recogniser (InsightFace) ...")
-        self.recogniser = FaceRecogniser(ctx_id=face_ctx_id)
+        self.recogniser = FaceRecogniser(
+            ctx_id   = face_ctx_id,
+            det_size = (face_det_size, face_det_size),   # smaller → faster
+        )
         self.watchlist  = Watchlist(similarity_threshold=face_sim_threshold)
 
         if watchlist_path:
@@ -122,24 +122,64 @@ class SmartCityPipeline:
         )
 
         print("[Pipeline] Loading ANPR Service (EasyOCR) ...")
-        self.anpr = ANPRService()
+        self.anpr = ANPRService(
+            plate_model_path = plate_model_path,   # NEW — enables YOLO plate localiser
+            min_confidence   = anpr_min_confidence,
+        )
 
         print("[Pipeline] Loading Dehazing Service (Dark Channel Prior) ...")
         self.dehazer = DehazingService()
 
-        print("[Pipeline] All models ready.\n")
+        # Persistent thread pool — created once, shared across all frames
+        self._pool = ThreadPoolExecutor(max_workers=n_threads,
+                                        thread_name_prefix="sc_infer")
+
+        print(
+            f"[Pipeline] All models ready.\n"
+            f"           anpr_interval={anpr_interval}  "
+            f"inference_max_side={inference_max_side}  "
+            f"face_det_size={face_det_size}  "
+            f"n_threads={n_threads}  "
+            f"plate_model={'YOLO (' + plate_model_path + ')' if plate_model_path else 'contour fallback'}\n"
+        )
+
+    # ── Frame helpers ─────────────────────────────────────────────────────────
+
+    def _maybe_downscale(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Resize frame so its longer side ≤ inference_max_side.
+        Returns original frame unchanged if downscaling is disabled or not needed.
+        """
+        if self._inference_max_side <= 0:
+            return frame
+        h, w = frame.shape[:2]
+        longer = max(h, w)
+        if longer <= self._inference_max_side:
+            return frame
+        scale  = self._inference_max_side / longer
+        new_w  = int(round(w * scale))
+        new_h  = int(round(h * scale))
+        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
     # ── Single Frame ──────────────────────────────────────────────────────────
 
     def process_frame(self, frame: np.ndarray) -> FrameEvent:
         """
-        Run full pipeline on one BGR frame.
+        Run full pipeline on one BGR frame with parallel inference.
 
         Steps:
-          1. Day/Night classification
-          2. Night enhancement  (if needed)
-          3. Vehicle detection  (YOLOv8 + ByteTrack)
-          4. Face recognition   (RetinaFace + ArcFace + watchlist)
+          1. Day/Night classification          (cheap heuristic first)
+          2. Night enhancement                 (only when needed)
+          3. Optional frame downscale          (speeds up all downstream models)
+          4. Parallel inference:
+               ├─ Vehicle detection  (YOLOv8 + ByteTrack)
+               ├─ Person detection   (YOLOv8 + ByteTrack)
+               └─ Face recognition   (RetinaFace + ArcFace + watchlist)
+          4b. ANPR (sequential, AFTER vehicle detection)
+               Runs only inside each detected vehicle's bounding box —
+               see services/anpr.py:read_plates_in_vehicles(). This needs
+               vehicle_result, so it can no longer run in the same parallel
+               batch as vehicle detection itself.
           5. Alert collection
 
         Returns FrameEvent with all results merged.
@@ -148,47 +188,56 @@ class SmartCityPipeline:
         frame_id  = f"frame_{self._frame_idx:06d}"
         timestamp = time.time()
 
-        # 1. Day / Night
+        # ── 1. Day / Night ────────────────────────────────────────────────────
         dn       = self.day_night.predict(frame)
         working  = frame
         enhanced = False
 
-        # 2. Enhance if night  (Zero-DCE++ or CLAHE fallback)
+        # ── 2. Enhance if night ───────────────────────────────────────────────
         if dn["route_to_enhancement"]:
             working  = self.enhancer.enhance(frame)
             enhanced = True
 
-        # 3. Vehicle detection
-        vehicle_result = self.vehicles.detect(
-            working,
-            frame_id  = frame_id,
-            camera_id = self.camera_id,
+        # ── 3. Optional downscale for inference speed ─────────────────────────
+        infer_frame = self._maybe_downscale(working)
+
+        # ── 4. Parallel inference (vehicles / persons / faces) ─────────────────
+        run_anpr = (
+            self._anpr_interval == 0
+            or (self._frame_idx % self._anpr_interval) == 1
         )
 
-        # 4. Person detection
-        person_result = self.person_detector.detect(
-            working,
-            frame_id  = frame_id,
-            camera_id = self.camera_id,
+        fut_vehicles : Future = self._pool.submit(
+            self.vehicles.detect, infer_frame, frame_id, self.camera_id
         )
-        vehicle_boxes  = [d.bbox for d in vehicle_result.detections]
-
-        # 5. ANPR — number plate reading
-        anpr_result = self.anpr.read_plates(
-            working,
-            frame_id  = frame_id,
-            camera_id = self.camera_id,
+        fut_persons : Future = self._pool.submit(
+            self.person_detector.detect, infer_frame, frame_id, self.camera_id
+        )
+        fut_faces : Future = self._pool.submit(
+            self.recogniser.recognise, infer_frame, self.watchlist, frame_id, self.camera_id
         )
 
-        # 6. Face recognition + watchlist
-        face_results = self.recogniser.recognise(
-            working,
-            self.watchlist,
-            frame_id  = frame_id,
-            camera_id = self.camera_id,
-        )
+        # Collect results (blocks until each is ready)
+        vehicle_result : VehicleDetectionResult = fut_vehicles.result()
+        person_result  : PersonDetectionResult  = fut_persons.result()
+        face_results   : list[FaceResult]       = fut_faces.result()
 
-        # 7. Alerts
+        # ── 4b. ANPR — cropped to vehicle boxes, run AFTER vehicle detection ───
+        # NOTE: adjust `v.bbox` below if VehicleDetection's bbox field is named
+        # differently in clashifiers/vechile_detector/main.py (e.g. v.box, v.xyxy).
+        if run_anpr:
+            vehicle_boxes = [v.bbox for v in vehicle_result.vehicles]
+            anpr_result = self.anpr.read_plates_in_vehicles(
+                infer_frame, vehicle_boxes, frame_id, self.camera_id
+            )
+            self._last_anpr_result = anpr_result
+        else:
+            # Reuse last known result; update its frame_id so the API stays consistent
+            anpr_result = self._last_anpr_result
+            if anpr_result is not None:
+                anpr_result.frame_id = frame_id
+
+        # ── 5. Alerts ─────────────────────────────────────────────────────────
         alerts = [
             {
                 "type":       "face_watchlist_hit",

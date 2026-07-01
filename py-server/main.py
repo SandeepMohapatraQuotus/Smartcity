@@ -8,33 +8,6 @@ Run:
 
 Swagger UI (auto-generated):
     http://localhost:8000/docs
-
-Routes
-------
-GET    /                          Health check
-GET    /status                    Pipeline info + uptime
-POST   /analyse/frame             Upload image  → JSON detections (full pipeline)
-POST   /analyse/base64            Base64 image  → JSON detections (full pipeline)
-POST   /analyse/frame/annotated   Upload image  → annotated JPEG (boxes drawn)
-POST   /classify/day-night        Upload image  → day/night label + confidence only
-POST   /enhance/frame             Upload image  → enhanced JPEG (Zero-DCE++ / CLAHE)
-POST   /detect/vehicles           Upload image  → vehicle detections only (YOLOv8)
-POST   /detect/persons            Upload image  → person detections only (YOLOv8)
-POST   /detect/persons/annotated  Upload image  → annotated JPEG with person boxes
-POST   /anpr/read                 Upload image  → number plate texts (EasyOCR)
-POST   /anpr/read/annotated       Upload image  → annotated JPEG with plate labels
-POST   /dehaze/frame              Upload hazy image → dehazed JPEG (Dark Channel Prior)
-POST   /dehaze/frame/compare      Upload hazy image → side-by-side comparison JPEG
-POST   /stream/start              Start RTSP stream (background task)
-POST   /stream/stop               Stop running stream
-GET    /stream/status             Stream state + frame count
-GET    /stream/mjpeg              Live annotated MJPEG stream (paste URL in browser)
-POST   /watchlist/add             Upload reference photo → add to watchlist
-DELETE /watchlist/{person_id}     Remove person from watchlist
-GET    /watchlist                 List all watchlist persons
-GET    /events?limit=50           Last N frame events (in-memory)
-GET    /alerts?limit=100          All face-match alerts
-DELETE /events                    Clear event + alert buffers
 """
 import uvicorn
 import asyncio
@@ -51,6 +24,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from PIL import Image, UnidentifiedImageError
 
 from pipeline import SmartCityPipeline, FrameEvent
 
@@ -85,9 +59,17 @@ async def lifespan(app: FastAPI):
     global pipeline
     print("[Server] Loading pipeline models ...")
     pipeline = SmartCityPipeline(
-        camera_id          = "cam_01",
-        vehicle_model_size = "yolov8m",
-        face_ctx_id        = -1,     # -1 = CPU;  set 0 if you have an NVIDIA GPU
+        camera_id           = "cam_01",
+        vehicle_model_size  = "yolov8m",
+        face_ctx_id         = -1,     # -1 = CPU;  set 0 if you have an NVIDIA GPU
+        anpr_interval       = 1,      # Process ANPR on every sampled frame
+        inference_max_side  = 0,      # Disable downscaling to preserve plate details
+        # ── ANPR: YOLOv11 plate detector  ← NEW ────────────────────────────
+        # Path to the fine-tuned plate-detection weights (see services/anpr.py).
+        # Falls back to the contour heuristic automatically if this file is
+        # missing, so it's safe to leave set even before you've downloaded it.
+        plate_model_path    = "weights/license_plate_yolov8n.pt",
+        anpr_min_confidence = 0.10,
     )
     print("[Server] Ready.\n")
     yield
@@ -125,14 +107,40 @@ class StreamStartRequest(BaseModel):
     camera_id : str = "cam_01"
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# Optional: register HEIC/HEIF support with Pillow if the plugin is installed
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
+
 
 def _decode_bytes(raw: bytes) -> np.ndarray:
-    arr   = np.frombuffer(raw, dtype=np.uint8)
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    # ── Fast path: OpenCV (JPEG, PNG, BMP, TIFF, WebP, etc.) ───────────────
+    arr = np.frombuffer(raw, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if frame is None:
-        raise HTTPException(status_code=400, detail="Cannot decode image. Send JPEG or PNG.")
-    return frame
+    if frame is not None:
+        return frame
+
+    # ── Fallback: Pillow (HEIC/HEIF, AVIF, GIF, ICO, CMYK JPEGs, etc.) ──────
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.seek(0)  # first frame if animated (GIF/WEBP)
+        img = img.convert("RGB")
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        return frame
+    except (UnidentifiedImageError, OSError, Exception):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cannot decode image. Supported formats: JPEG, PNG, BMP, TIFF, "
+                "WEBP, GIF, HEIC/HEIF, ICO. The file may be corrupt or truncated."
+            ),
+        )
 
 def _decode_b64(b64: str) -> np.ndarray:
     try:
@@ -177,6 +185,7 @@ async def status():
             "day_night_classifier": "MobileNetV2  (ImageNet pretrained)",
             "vehicle_detector":     "YOLOv8m      (COCO pretrained)",
             "face_recogniser":      "RetinaFace + ArcFace  (InsightFace buffalo_l)",
+            "anpr_plate_detector":  "YOLOv11n (fine-tuned)" if (pipeline and pipeline.anpr._yolo_detector is not None) else "contour heuristic (fallback)",
         },
     }
 
@@ -190,12 +199,6 @@ async def analyse_frame(
 ):
     """
     Upload an image file → run all 3 classifiers → return JSON.
-
-    Response includes:
-      - day_night  : label + confidence + enhancement flag
-      - vehicles   : list of detections (label, bbox, confidence, track_id)
-      - faces      : list of detections + watchlist matches
-      - alerts     : face-watchlist hits
     """
     frame = _decode_bytes(await file.read())
     pipeline.camera_id = camera_id
@@ -250,11 +253,6 @@ async def classify_day_night(
 ):
     """
     Run **only** the Day/Night classifier on an uploaded image.
-
-    Response:
-      - label              : \"day\" | \"night\"
-      - confidence         : float  (0.0 – 1.0)
-      - route_to_enhancement : bool — True if frame should be enhanced
     """
     frame = _decode_bytes(await file.read())
     result = pipeline.day_night.predict(frame)
@@ -267,10 +265,6 @@ async def enhance_frame(
 ):
     """
     Run **only** the Zero-DCE++ image enhancer on an uploaded image.
-
-    Returns the enhanced image as a JPEG.
-    Response headers:
-      - X-Enhancement-Method : \"zero_dce++\" | \"clahe\"  (fallback)
     """
     frame    = _decode_bytes(await file.read())
     enhanced = pipeline.enhancer.enhance(frame)
@@ -289,12 +283,6 @@ async def detect_vehicles(
 ):
     """
     Run **only** the Vehicle Detector (YOLOv8) on an uploaded image.
-
-    Response includes:
-      - frame_id   : auto-generated
-      - camera_id  : echoed back
-      - vehicles   : list of { label, bbox, confidence, track_id }
-      - count      : total detections
     """
     frame  = _decode_bytes(await file.read())
     result = pipeline.vehicles.detect(
@@ -312,10 +300,6 @@ async def detect_persons(
 ):
     """
     Run **only** the Person Detector (YOLOv8) on an uploaded image.
-
-    Response includes:
-      - person_count : total persons detected
-      - detections   : list of { bbox, confidence, track_id, center, area }
     """
     frame  = _decode_bytes(await file.read())
     result = pipeline.person_detector.detect(
@@ -325,7 +309,29 @@ async def detect_persons(
     )
     return JSONResponse(content=result.to_dict())
 
+def _extract_vehicle_boxes(vehicle_result) -> list:
+    """
+    Pull bbox list out of VehicleDetectionResult regardless of the exact
+    attribute name used for the detections list / bbox field.
+    """
+    for attr in ("vehicles", "detections", "objects", "results", "items"):
+        items = getattr(vehicle_result, attr, None)
+        if items is not None:
+            break
+    else:
+        raise AttributeError(
+            f"VehicleDetectionResult has no known detections attribute. "
+            f"Available: {[a for a in dir(vehicle_result) if not a.startswith('_')]}"
+        )
 
+    boxes = []
+    for v in items:
+        for box_attr in ("bbox", "box", "xyxy"):
+            box = getattr(v, box_attr, None)
+            if box is not None:
+                boxes.append(list(box))
+                break
+    return boxes
 
 @app.post("/anpr/read", tags=["ANPR"])
 async def anpr_read(
@@ -335,50 +341,58 @@ async def anpr_read(
     """
     Run **ANPR** (Automatic Number Plate Recognition) on an uploaded image.
 
-    Two-stage pipeline:
-      1. Plate localisation  (contour heuristic, or YOLO if weights provided)
-      2. OCR                 (EasyOCR preferred, pytesseract fallback)
+    Vehicle detection (YOLOv8) runs first, and plate search is restricted to
+    each detected vehicle's bounding box — same behaviour as the live
+    pipeline (fewer false positives from background clutter, signs, etc.)
 
-    Response includes:
-      - plate_count  : number of plates found
-      - ocr_engine   : which OCR backend was used
-      - plates       : list of { bbox, raw_text, cleaned_text, confidence }
+    Two-stage pipeline:
+      1. Plate localisation  (YOLOv11 fine-tuned detector, or contour heuristic fallback)
+      2. OCR                 (EasyOCR preferred, pytesseract fallback)
     """
-    frame  = _decode_bytes(await file.read())
-    result = pipeline.anpr.read_plates(
-        frame,
-        frame_id  = f"anpr_{int(time.time()*1000)}",
-        camera_id = camera_id,
+    frame = _decode_bytes(await file.read())
+    frame_id = f"anpr_{int(time.time()*1000)}"
+
+    vehicle_result = pipeline.vehicles.detect(frame, frame_id=frame_id, camera_id=camera_id)
+    vehicle_boxes  = _extract_vehicle_boxes(vehicle_result)
+
+
+    result = pipeline.anpr.read_plates_in_vehicles(
+        frame, vehicle_boxes, frame_id=frame_id, camera_id=camera_id,
     )
     return JSONResponse(content=result.to_dict())
 
-
 @app.post("/anpr/read/annotated", tags=["ANPR"])
 async def anpr_read_annotated(
-    file      : UploadFile = File(..., description="JPEG or PNG image containing a vehicle"),
+    file      : UploadFile = File(...),
     camera_id : str        = Form(default="cam_01"),
 ):
     """
-    Upload an image → returns annotated JPEG with plate bounding boxes and
-    recognised text drawn directly on the image.
+    Upload an image → returns annotated JPEG with vehicle boxes, plate
+    bounding boxes, and recognised text drawn directly on the image.
     """
-    frame  = _decode_bytes(await file.read())
-    result = pipeline.anpr.read_plates(
-        frame,
-        frame_id  = f"anpr_{int(time.time()*1000)}",
-        camera_id = camera_id,
+    frame = _decode_bytes(await file.read())
+    frame_id = f"anpr_{int(time.time()*1000)}"
+
+    vehicle_result = pipeline.vehicles.detect(frame, frame_id=frame_id, camera_id=camera_id)
+    vehicle_boxes  = _extract_vehicle_boxes(vehicle_result)
+
+    result = pipeline.anpr.read_plates_in_vehicles(
+        frame, vehicle_boxes, frame_id=frame_id, camera_id=camera_id,
     )
-    annotated = pipeline.anpr.draw(frame, result)
-    _, buf    = cv2.imencode(".jpg", annotated)
+
+    annotated = pipeline.vehicles.draw(frame, vehicle_result)
+    annotated = pipeline.anpr.draw(annotated, result)
+
+    _, buf = cv2.imencode(".jpg", annotated)
     return StreamingResponse(
         io.BytesIO(buf.tobytes()),
         media_type = "image/jpeg",
         headers    = {
-            "X-Plate-Count": str(len(result.plates)),
-            "X-OCR-Engine":  result.ocr_engine,
+            "X-Vehicle-Count": str(len(vehicle_boxes)),   # ← was vehicle_result.vehicles
+            "X-Plate-Count":   str(len(result.plates)),
+            "X-OCR-Engine":    result.ocr_engine,
         },
     )
-
 
 # ─── Dehazing ─────────────────────────────────────────────────────────────────
 
@@ -389,17 +403,6 @@ async def dehaze_frame(
 ):
     """
     Remove haze, fog, or smoke from an uploaded image.
-
-    **Algorithm auto-selection:**
-    - Standard outdoor haze/fog → **Sky-Aware DCP** with colour correction + sharpening
-    - Bright / overcast / sky-dominant → **MSRCR** (Multi-Scale Retinex)
-
-    `strength` controls how aggressively haze is removed (0.5 = gentle, 1.0 = maximum).
-
-    Returns the dehazed image as a JPEG.
-    Response headers:
-      - X-Atm-Light : estimated fog density
-      - X-Method    : `dcp` | `msrcr`
     """
     pipeline.dehazer.omega = max(0.3, min(1.0, strength))
     frame  = _decode_bytes(await file.read())
@@ -420,10 +423,7 @@ async def dehaze_frame_compare(
     file: UploadFile = File(..., description="Hazy / foggy JPEG or PNG image"),
 ):
     """
-    Remove haze from an image and return a **side-by-side comparison** JPEG:
-    left half = original hazy image, right half = dehazed output.
-
-    Useful for visual validation on the dashboard.
+    Remove haze from an image and return a **side-by-side comparison** JPEG.
     """
     frame  = _decode_bytes(await file.read())
     result = pipeline.dehazer.dehaze(frame)
@@ -468,7 +468,7 @@ async def _stream_worker(source: str, camera_id: str):
     stream_state["frame_count"] = 0
     pipeline.camera_id = camera_id
 
-    PROCESS_EVERY_N = 3  # only run inference every 3rd frame, tune as needed
+    PROCESS_EVERY_N = 1  # Process every frame for high-speed scenarios
 
     try:
         frame_idx = 0
@@ -537,8 +537,6 @@ async def stream_status():
 def _draw_all(frame: np.ndarray, event: "FrameEvent") -> np.ndarray:
     """
     Draws all classifier results onto the frame and returns the annotated copy.
-    Calls each classifier's own .draw() method so annotations stay consistent
-    with what you see from /analyse/frame/annotated.
     """
     annotated = frame.copy()
     if event.vehicles:
@@ -555,7 +553,6 @@ def _draw_all(frame: np.ndarray, event: "FrameEvent") -> np.ndarray:
 def _open_capture(source: str) -> cv2.VideoCapture:
     """
     Opens a VideoCapture and raises a clean 400 if it fails.
-    Accepts: "0","1",… for device index  or  any URL / file path.
     """
     target = int(source) if source.isdigit() else source
     cap = cv2.VideoCapture(target)
@@ -628,10 +625,7 @@ async def _mjpeg_generator(cap: cv2.VideoCapture, jpeg_quality: int = 75):
 )
 async def stream_mjpeg(source: str = None, quality: int = 75):
     """
-    GET /stream/mjpeg                                  ← reuses POST /stream/start source
-    GET /stream/mjpeg?source=/path/to/video.mp4
-    GET /stream/mjpeg?source=rtsp://192.168.1.10:554/ch0
-    GET /stream/mjpeg?quality=90
+    GET /stream/mjpeg
     """
     resolved = source or stream_state.get("source")
     if not resolved:
@@ -660,7 +654,6 @@ async def stream_mjpeg(source: str = None, quality: int = 75):
 def stream_sources():
     """
     Probes device indices 0-9 and returns which ones OpenCV can open.
-    Use this to find the right index before calling /stream/mjpeg.
     """
     found = []
     for i in range(10):
@@ -697,7 +690,6 @@ async def watchlist_add(
 ):
     """
     Add a person to the face watchlist.
-    Uploads a reference photo, extracts ArcFace embedding, stores in memory.
     """
     frame = _decode_bytes(await photo.read())
     try:
@@ -732,7 +724,6 @@ async def watchlist_list():
 async def _broadcast_update():
     """
     Build the current snapshot and push it to every connected WS client.
-    Dead connections are silently pruned.
     """
     if not _ws_clients:
         return
@@ -768,16 +759,6 @@ def _ws_snapshot() -> dict:
 async def websocket_endpoint(ws: WebSocket):
     """
     WebSocket endpoint — ws://localhost:8000/ws
-
-    Pushes a JSON snapshot every 500 ms and immediately after each new
-    processed frame so the frontend stays in sync without polling.
-
-    Message schema:
-    {
-      "stream_status": { running, source, camera_id, frames_processed, error },
-      "latest_event":  FrameEvent | null,
-      "alerts":        AlertEvent[]
-    }
     """
     await ws.accept()
     _ws_clients.add(ws)
@@ -789,9 +770,6 @@ async def websocket_endpoint(ws: WebSocket):
         return
 
     try:
-        # Keep the connection alive; also push a heartbeat every 500 ms so
-        # the client always sees up-to-date stream_status even when no new
-        # frames are being processed.
         while True:
             await asyncio.sleep(0.5)
             try:

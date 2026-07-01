@@ -26,3 +26,6 @@ scikit-image>=0.20.0          # required by insightface
 
 # ── Stream / Kafka (optional) ─────────────────────────
 # kafka-python>=2.0.2         # uncomment if using Kafka stream integration
+
+Pillow>=10.0.0
+pillow-heif>=0.15.0   # optional, only needed for iPhone .heic uploads
