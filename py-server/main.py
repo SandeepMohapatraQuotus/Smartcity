@@ -64,12 +64,20 @@ async def lifespan(app: FastAPI):
         face_ctx_id         = -1,     # -1 = CPU;  set 0 if you have an NVIDIA GPU
         anpr_interval       = 1,      # Process ANPR on every sampled frame
         inference_max_side  = 0,      # Disable downscaling to preserve plate details
-        # ── ANPR: YOLOv11 plate detector  ← NEW ────────────────────────────
+        # ── ANPR: YOLOv11 plate detector ────────────────────────────
         # Path to the fine-tuned plate-detection weights (see services/anpr.py).
         # Falls back to the contour heuristic automatically if this file is
         # missing, so it's safe to leave set even before you've downloaded it.
         plate_model_path    = "weights/license_plate_yolov8n.pt",
         anpr_min_confidence = 0.10,
+        # ── Night enhancement chain: Gamma Correction -> CLAHE -> Zero-DCE++ ──
+        # All three stages run in sequence on every frame routed to enhancement.
+        # Flip any of these to False to drop that stage from the chain.
+        enhance_gamma        = True,
+        enhance_clahe         = True,
+        enhance_zero_dce      = True,
+        gamma_target_mean     = 128.0,
+        clahe_clip_limit      = 3.0,
     )
     print("[Server] Ready.\n")
     yield
@@ -186,6 +194,10 @@ async def status():
             "vehicle_detector":     "YOLOv8m      (COCO pretrained)",
             "face_recogniser":      "RetinaFace + ArcFace  (InsightFace buffalo_l)",
             "anpr_plate_detector":  "YOLOv11n (fine-tuned)" if (pipeline and pipeline.anpr._yolo_detector is not None) else "contour heuristic (fallback)",
+            "night_enhancer":       (
+                "Gamma Correction -> CLAHE -> Zero-DCE++ (chained)"
+                if pipeline else "loading"
+            ),
         },
     }
 
@@ -264,7 +276,10 @@ async def enhance_frame(
     file: UploadFile = File(..., description="JPEG or PNG image (preferably low-light)"),
 ):
     """
-    Run **only** the Zero-DCE++ image enhancer on an uploaded image.
+    Run the full night-enhancement CHAIN on an uploaded image:
+        Gamma Correction  →  CLAHE  →  Zero-DCE++
+    Each stage feeds the next; any stage disabled at pipeline startup is
+    skipped. Returns the enhanced JPEG with headers describing what ran.
     """
     frame    = _decode_bytes(await file.read())
     enhanced = pipeline.enhancer.enhance(frame)
@@ -272,7 +287,11 @@ async def enhance_frame(
     return StreamingResponse(
         io.BytesIO(buf.tobytes()),
         media_type = "image/jpeg",
-        headers    = {"X-Enhancement-Method": pipeline.enhancer.method},
+        headers    = {
+            "X-Enhancement-Method": pipeline.enhancer.method,
+            "X-Stages-Applied":     ",".join(pipeline.enhancer.last_stages_applied),
+            "X-Gamma-Used":         str(pipeline.enhancer.last_gamma),
+        },
     )
 
 

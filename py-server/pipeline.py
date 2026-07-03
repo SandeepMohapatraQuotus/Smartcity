@@ -1,5 +1,3 @@
-
-
 import cv2
 import time
 import numpy as np
@@ -76,10 +74,23 @@ class SmartCityPipeline:
                                              # (0 = disabled, use original resolution)
         face_det_size       : int   = 320,   # InsightFace detection grid (320 or 640)
         n_threads           : int   = 4,     # parallel inference workers
-        # ── ANPR knobs  ← NEW ────────────────────────────────────────────────
+        # ── ANPR knobs ────────────────────────────────────────────────────────
         plate_model_path    : Optional[str] = None,   # path to YOLOv8 plate-detection .pt
                                                         # (None → falls back to contour heuristic)
         anpr_min_confidence : float = 0.10,
+        # ── Night enhancement chain knobs  ← NEW ─────────────────────────────
+        # Every frame routed to enhancement runs through ALL enabled stages
+        # in sequence: Gamma Correction → CLAHE → Zero-DCE++. Disable any
+        # stage individually if you only want a subset of the chain.
+        enhance_gamma        : bool  = True,
+        enhance_clahe         : bool  = True,
+        enhance_zero_dce      : bool  = True,
+        gamma_target_mean     : float = 128.0,   # adaptive-gamma brightness target (0-255)
+        clahe_clip_limit      : float = 3.0,     # CLAHE contrast clip threshold
+        clahe_tile_grid_size  : tuple = (8, 8),  # CLAHE tile grid
+        zero_dce_weights_path : Optional[str] = None,   # None → use package default path
+        zero_dce_scale_factor : int   = 12,
+        zero_dce_device        : str   = "cpu",
     ):
         self.camera_id = camera_id
         self._frame_idx = 0
@@ -112,8 +123,21 @@ class SmartCityPipeline:
             if os.path.exists(watchlist_path):
                 self.watchlist.load(watchlist_path)
 
-        print("[Pipeline] Loading Night Enhancer (Zero-DCE++) ...")
-        self.enhancer = ZeroDCEEnhancer()
+        print("[Pipeline] Loading Night Enhancer "
+              "(Gamma Correction -> CLAHE -> Zero-DCE++ chain) ...")
+        enhancer_kwargs = dict(
+            scale_factor          = zero_dce_scale_factor,
+            device                 = zero_dce_device,
+            enable_gamma            = enhance_gamma,
+            enable_clahe             = enhance_clahe,
+            enable_zero_dce          = enhance_zero_dce,
+            gamma_target_mean        = gamma_target_mean,
+            clahe_clip_limit         = clahe_clip_limit,
+            clahe_tile_grid_size     = clahe_tile_grid_size,
+        )
+        if zero_dce_weights_path:
+            enhancer_kwargs["weights_path"] = zero_dce_weights_path
+        self.enhancer = ZeroDCEEnhancer(**enhancer_kwargs)
 
         print("[Pipeline] Loading Person Detector (YOLOv8) ...")
         self.person_detector = PersonDetector(
@@ -123,7 +147,7 @@ class SmartCityPipeline:
 
         print("[Pipeline] Loading ANPR Service (EasyOCR) ...")
         self.anpr = ANPRService(
-            plate_model_path = plate_model_path,   # NEW — enables YOLO plate localiser
+            plate_model_path = plate_model_path,   # enables YOLO plate localiser
             min_confidence   = anpr_min_confidence,
         )
 
@@ -141,6 +165,8 @@ class SmartCityPipeline:
             f"face_det_size={face_det_size}  "
             f"n_threads={n_threads}  "
             f"plate_model={'YOLO (' + plate_model_path + ')' if plate_model_path else 'contour fallback'}\n"
+            f"           enhancement_chain=gamma:{enhance_gamma} clahe:{enhance_clahe} "
+            f"zero_dce:{enhance_zero_dce}\n"
         )
 
     # ── Frame helpers ─────────────────────────────────────────────────────────
@@ -169,7 +195,8 @@ class SmartCityPipeline:
 
         Steps:
           1. Day/Night classification          (cheap heuristic first)
-          2. Night enhancement                 (only when needed)
+          2. Night enhancement                 (only when needed) — chained
+             Gamma Correction -> CLAHE -> Zero-DCE++, see services/zero_dce.py
           3. Optional frame downscale          (speeds up all downstream models)
           4. Parallel inference:
                ├─ Vehicle detection  (YOLOv8 + ByteTrack)
@@ -193,7 +220,7 @@ class SmartCityPipeline:
         working  = frame
         enhanced = False
 
-        # ── 2. Enhance if night ───────────────────────────────────────────────
+        # ── 2. Enhance if night — chained gamma -> CLAHE -> Zero-DCE++ ─────────
         if dn["route_to_enhancement"]:
             working  = self.enhancer.enhance(frame)
             enhanced = True

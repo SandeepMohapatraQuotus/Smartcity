@@ -1,6 +1,6 @@
 # Smart City Platform — py-server Documentation
 
-> **Last updated:** 2026-06-29 | **Server:** FastAPI + Uvicorn | **Python:** 3.10+
+> **Last updated:** 2026-07-03 | **Server:** FastAPI + Uvicorn | **Python:** 3.10+
 
 ---
 
@@ -14,7 +14,7 @@ The `py-server` is the **AI/ML backend** of the Smart City Platform. It accepts 
 |----------|-------------|
 | **Traffic monitoring** | YOLOv8 detects and tracks cars, trucks, buses, motorcycles with unique IDs |
 | **Person crowd monitoring** | YOLOv8 detects and counts people in a scene |
-| **Night-time surveillance** | Auto-detects dark frames and enhances them (Zero-DCE++ / CLAHE) before detection |
+| **Night-time surveillance** | Auto-detects dark frames and enhances them through a chained pipeline (Gamma Correction → CLAHE → Zero-DCE++) before detection |
 | **Vehicle number plate reading** | ANPR pipeline localises plates + EasyOCR reads the text |
 | **Face watchlist alerts** | Detects faces, generates ArcFace embeddings, matches against a watchlist of persons of interest |
 | **Haze/fog removal** | Dark Channel Prior + MSRCR converts foggy frames to clear images |
@@ -49,7 +49,8 @@ py-server/
 │
 ├── services/
 │   ├── __init__.py
-│   ├── zero_dce.py                      ← Night enhancer (Zero-DCE++ / CLAHE fallback)
+│   ├── classical_enhance.py             ← Gamma Correction + CLAHE (model-free enhancement)
+│   ├── zero_dce.py                      ← Night enhancer — chains Gamma → CLAHE → Zero-DCE++
 │   ├── anpr.py                          ← Number plate recognition (EasyOCR)
 │   └── dehazing.py                      ← Haze/fog removal (DCP + MSRCR)
 │
@@ -91,7 +92,7 @@ py-server/
 | Method | Route | Input | Output |
 |--------|-------|-------|--------|
 | `POST` | `/classify/day-night` | Image upload | `{ label, confidence, route_to_enhancement, method }` |
-| `POST` | `/enhance/frame` | Image upload | Enhanced JPEG (Zero-DCE++ or CLAHE fallback) |
+| `POST` | `/enhance/frame` | Image upload | Enhanced JPEG — chained Gamma → CLAHE → Zero-DCE++ |
 | `POST` | `/detect/vehicles` | Image upload | JSON — vehicle list with bbox, label, confidence, track_id |
 | `POST` | `/detect/persons` | Image upload | JSON — person list with bbox, confidence, track_id, center, area |
 
@@ -144,7 +145,7 @@ py-server/
 **Role:** Entry point for all HTTP requests. Loads the pipeline once at startup, routes requests to the correct service, serialises results.
 
 **Key internals:**
-- `lifespan()` — FastAPI lifespan handler that constructs `SmartCityPipeline` at startup and cleans up streams on shutdown
+- `lifespan()` — FastAPI lifespan handler that constructs `SmartCityPipeline` at startup (including the enhancement-chain knobs) and cleans up streams on shutdown
 - `event_buffer` — `deque(maxlen=500)` storing the last 500 frame JSON results
 - `alert_buffer` — `deque(maxlen=200)` storing face watchlist hit alerts
 - `_decode_bytes(raw)` — decodes raw file upload bytes into a BGR numpy array
@@ -152,6 +153,9 @@ py-server/
 - `_serialise(event)` — converts `FrameEvent` to JSON-safe dict, stripping numpy embeddings
 - `_store(event)` — appends event + alerts to both ring buffers
 - CORS middleware enabled for all origins (development mode)
+
+`POST /enhance/frame` returns the enhanced JPEG plus diagnostic headers:
+`X-Enhancement-Method` (e.g. `gamma[1.62]+clahe+zero_dce`), `X-Stages-Applied` (comma list of stages that actually ran), `X-Gamma-Used` (the adaptive gamma value picked for that frame).
 
 ---
 
@@ -167,7 +171,8 @@ BGR Frame
     ▼
 [1] DayNightClassifier.predict()
     │
-    ├── night? ──▶ [2] ZeroDCEEnhancer.enhance()   (Zero-DCE++ or CLAHE)
+    ├── night? ──▶ [2] ZeroDCEEnhancer.enhance()
+    │                    Gamma Correction → CLAHE → Zero-DCE++ (chained)
     │                         │
     └─────────────────────────┘
                   │
@@ -208,6 +213,21 @@ BGR Frame
 | `face_ctx_id` | `-1` | InsightFace context: -1 = CPU, 0 = GPU |
 | `day_night_weights` | `None` | Optional custom day/night weights |
 | `face_sim_threshold` | `0.55` | Cosine similarity threshold for watchlist match |
+| `anpr_interval` | `5` | Run ANPR every N frames (0 = every frame) |
+| `inference_max_side` | `960` | Resize longer edge before inference (0 = disabled) |
+| `face_det_size` | `320` | InsightFace detection grid (320 or 640) |
+| `n_threads` | `4` | Parallel inference workers |
+| `plate_model_path` | `None` | Path to fine-tuned YOLO plate detector (None → contour heuristic) |
+| `anpr_min_confidence` | `0.10` | Minimum OCR confidence for a plate reading |
+| `enhance_gamma` | `True` | Enable the Gamma Correction stage in the enhancement chain |
+| `enhance_clahe` | `True` | Enable the CLAHE stage in the enhancement chain |
+| `enhance_zero_dce` | `True` | Enable the Zero-DCE++ stage in the enhancement chain |
+| `gamma_target_mean` | `128.0` | Target mean luminance (0–255) the adaptive gamma stage aims for |
+| `clahe_clip_limit` | `3.0` | CLAHE contrast clip threshold |
+| `clahe_tile_grid_size` | `(8, 8)` | CLAHE tile grid size |
+| `zero_dce_weights_path` | `None` | Override path to Zero-DCE++ `.pth` (None → package default) |
+| `zero_dce_scale_factor` | `12` | Zero-DCE++ internal downscale factor |
+| `zero_dce_device` | `"cpu"` | Device for the Zero-DCE++ CNN stage |
 
 ---
 
@@ -305,28 +325,66 @@ BGR Frame
 
 ---
 
-### `services/zero_dce.py` — Night Image Enhancer
+### `services/classical_enhance.py` — Gamma Correction + CLAHE
+
+**Purpose:** Lightweight, CPU-only, model-free enhancement building blocks used by `ZeroDCEEnhancer`. No weights, no GPU, sub-millisecond per frame at 1080p.
+
+**Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `gamma_correction(frame, gamma=1.5)` | Brightens (`gamma > 1`) or darkens (`gamma < 1`) via a 256-entry LUT |
+| `estimate_gamma(frame, target_mean=128.0)` | Picks a gamma value from the frame's current mean luminance so it moves toward `target_mean`. Dark frames → gamma > 1; overexposed frames → gamma < 1 |
+| `clahe_enhance(frame, clip_limit=3.0, tile_grid_size=(8,8))` | Applies CLAHE to the L channel of LAB colour space — boosts local contrast while leaving colour untouched |
+| `auto_enhance(frame, ...)` | Combined helper: adaptive gamma → CLAHE in one call. Returns `{ frame, gamma, method }` |
+
+---
+
+### `services/zero_dce.py` — Night Image Enhancer (Chained Pipeline)
 
 **Purpose:** Enhances low-light / night frames before detection runs on them.
 
-**Method:** Zero-DCE++ (Zero-Reference Deep Curve Estimation, TPAMI 2021)  
-**Fallback:** CLAHE (Contrast Limited Adaptive Histogram Equalisation) if weights are missing.
+**Pipeline — every enabled stage runs in sequence, each stage's output feeding the next:**
 
-**Pipeline:**
-- BGR → RGB float32 → pad to scale_factor multiple → tensor → `enhance_net_nopool` → crop → RGB → BGR
+```
+raw frame
+    │
+    ▼
+1. Gamma Correction   — adaptive, fixes GLOBAL exposure
+    │
+    ▼
+2. CLAHE               — fixes LOCAL contrast (colour-preserving, LAB L-channel)
+    │
+    ▼
+3. Zero-DCE++ (CNN)    — final deep-learned refinement pass
+    │
+    ▼
+enhanced frame
+```
+
+Any stage can be disabled individually via constructor flags. If the Zero-DCE++ stage is enabled but its weights are missing/broken, that stage alone is skipped (with a one-time startup warning) — the gamma and CLAHE stages still run, so the pipeline never crashes for lack of model weights. This replaces the old "CLAHE as fallback" behaviour: CLAHE now always runs as a permanent stage rather than only substituting for a missing model.
 
 **Class:** `ZeroDCEEnhancer`
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| `weights_path` | `Epoch99.pth` | Path to pretrained weights |
-| `scale_factor` | `1` | Downscale factor (1 = full res, 12 = paper default) |
-| `device` | `"auto"` | `auto` / `cpu` / `cuda` |
+| `weights_path` | `Epoch99.pth` | Path to pretrained Zero-DCE++ weights |
+| `scale_factor` | `12` | Zero-DCE++ downscale factor (1 = full res, 12 = paper default) |
+| `device` | `"cpu"` | `cpu` / `cuda` / `cuda:0` |
+| `enable_gamma` | `True` | Run the Gamma Correction stage |
+| `enable_clahe` | `True` | Run the CLAHE stage |
+| `enable_zero_dce` | `True` | Run the Zero-DCE++ stage |
+| `gamma_target_mean` | `128.0` | Target mean luminance (0–255) for the adaptive gamma stage |
+| `clahe_clip_limit` | `3.0` | CLAHE contrast clip threshold |
+| `clahe_tile_grid_size` | `(8, 8)` | CLAHE tile grid size |
 
-- `enhance(frame)` — BGR in → BGR out (enhanced)
-- `method` property — returns `"zero_dce++"` or `"clahe"`
+**Methods / properties:**
+- `enhance(frame)` — BGR in → BGR out, runs every enabled stage in order
+- `last_stages_applied` — list of stages that actually ran on the last frame, e.g. `["gamma", "clahe", "zero_dce"]` (Zero-DCE++ dropped automatically if weights unavailable)
+- `last_gamma` — the adaptive gamma value used on the last frame (`None` if the gamma stage was disabled)
+- `method` property — human-readable summary of the last run, e.g. `"gamma[1.62]+clahe+zero_dce"`
 
-**Route:** `POST /enhance/frame`
+**Route:** `POST /enhance/frame` (response headers: `X-Enhancement-Method`, `X-Stages-Applied`, `X-Gamma-Used`)
 
 ---
 
@@ -406,7 +464,7 @@ Triggered when mean brightness > 0.72 (overcast sky, milky haze, back-lit scenes
 
 ### `Zero-DCE_extension/Zero-DCE++/` — Night Enhancement Model Source
 
-> This is a **cloned external repo** — do not modify. Already integrated via `services/zero_dce.py`.
+> This is a **cloned external repo** — do not modify. Already integrated via `services/zero_dce.py` as the final stage of the enhancement chain.
 
 | File | Purpose |
 |------|---------|
@@ -455,7 +513,8 @@ graph TB
     end
 
     subgraph SV["services/"]
-        ZD["ZeroDCEEnhancer\nZero-DCE++ / CLAHE"]
+        CE["classical_enhance.py\nGamma Correction + CLAHE"]
+        ZD["ZeroDCEEnhancer\nGamma -> CLAHE -> Zero-DCE++"]
         AN["ANPRService\nContour + EasyOCR"]
         DH["DehazingService\nDCP + MSRCR"]
     end
@@ -472,6 +531,7 @@ graph TB
     R7 --> DH
     PF --> DN
     PF --> ZD
+    ZD --> CE
     PF --> VD
     PF --> PD
     PF --> AN
@@ -497,6 +557,7 @@ main.py
         └── services/dehazing.py                   → DehazingService
 
 services/zero_dce.py
+  ├── services/classical_enhance.py               → gamma_correction, estimate_gamma, clahe_enhance
   └── Zero-DCE_extension/Zero-DCE++/model.py      → enhance_net_nopool
 ```
 
@@ -530,7 +591,7 @@ python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 |----------|-----------|
 | All models loaded **once at startup** | Avoids per-request model load time (~10–30s per model) |
 | YOLOv8m shared between vehicle + person detector | One `.pt` file, two class-filtered inference calls |
-| Zero-DCE++ with CLAHE fallback | Pipeline never crashes if `Epoch99.pth` is missing |
+| Night enhancement is a **chained pipeline**, not a single fallback | Gamma Correction fixes global exposure, CLAHE fixes local contrast, Zero-DCE++ adds a final deep-learned pass — each stage compensates for what the previous one leaves behind. If Zero-DCE++ weights are missing, only that stage is skipped; the classical stages still run, so the pipeline never crashes |
 | EasyOCR with pytesseract fallback | Flexible OCR with graceful degradation |
 | DCP auto-selects MSRCR for bright scenes | DCP fails on sky-dominant images — MSRCR handles them better |
 | In-memory event/alert buffers | Low-latency, no DB dependency for live dashboard |

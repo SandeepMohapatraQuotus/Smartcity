@@ -1,21 +1,45 @@
 """
-Zero-DCE++ Night Enhancement Service
---------------------------------------
+Night Enhancement Service — Chained Pipeline
+    Gamma Correction  →  CLAHE  →  Zero-DCE++
+--------------------------------------------------------------------
 Path : py-server/services/zero_dce.py
 
-Wraps the Zero-DCE++ model (from Zero-DCE_extension/) into a clean,
-pipeline-friendly interface that:
+Runs every enhancement stage on the frame IN SEQUENCE, each stage
+operating on the output of the previous one:
 
-  1.  Loads the pretrained model once  (Epoch99.pth)
-  2.  Accepts a BGR numpy array  (OpenCV convention)
-  3.  Returns an enhanced BGR numpy array
-  4.  Works on both CPU and GPU transparently
-  5.  Falls back to CLAHE if model weights are missing
+    raw frame
+        │
+        ▼
+    1. Gamma Correction   — fixes GLOBAL exposure (adaptive: gamma is
+                             computed per-frame from its mean luminance,
+                             so a very dark frame gets brightened more
+                             than a mildly dark one).
+        │
+        ▼
+    2. CLAHE               — fixes LOCAL contrast (recovers detail in
+                             shadows/highlights left flat by step 1;
+                             operates on the L channel of LAB so colour
+                             is preserved).
+        │
+        ▼
+    3. Zero-DCE++ (CNN)    — final deep-learned refinement pass. Skipped
+                             automatically (with a one-time warning) if
+                             its weights aren't available — the first two
+                             classical stages still run either way, so the
+                             pipeline never crashes for lack of weights.
+        │
+        ▼
+    enhanced frame
+
+Any stage can be switched off individually via the constructor flags
+below if you only want a subset of the chain.
 
 Usage inside pipeline.py:
     from services.zero_dce import ZeroDCEEnhancer
-    enhancer = ZeroDCEEnhancer()                       # loads model
-    enhanced = enhancer.enhance(frame)                  # BGR in → BGR out
+    enhancer = ZeroDCEEnhancer()                # all 3 stages on by default
+    enhanced = enhancer.enhance(frame)          # BGR in → BGR out, chained
+    enhancer.last_stages_applied                # e.g. ["gamma", "clahe", "zero_dce"]
+    enhancer.last_gamma                         # gamma value used on this frame
 
 The original Zero-DCE++ repo lives at:
     Zero-DCE_extension/Zero-DCE++/
@@ -29,6 +53,8 @@ import cv2
 import time
 import numpy as np
 import torch
+
+from services.classical_enhance import gamma_correction, estimate_gamma, clahe_enhance
 
 # ─── Resolve the Zero-DCE++ module path ──────────────────────────────────────
 # The folder is called "Zero-DCE++" which is not a valid Python identifier,
@@ -46,55 +72,77 @@ if _ZDCE_DIR not in sys.path:
 from model import enhance_net_nopool  # type: ignore[import-untyped]
 
 
-# ─── CLAHE Fallback ──────────────────────────────────────────────────────────
-
-def _clahe_enhance(frame: np.ndarray) -> np.ndarray:
-    """
-    Baseline CLAHE enhancement — used as fallback when Zero-DCE++
-    weights are not available.
-    """
-    lab     = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = cv2.merge([clahe.apply(l), a, b])
-    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
-
-
 # ─── Enhancer ─────────────────────────────────────────────────────────────────
 
 class ZeroDCEEnhancer:
     """
-    Production-ready wrapper around Zero-DCE++ for low-light enhancement.
+    Chained low-light enhancer: Gamma Correction → CLAHE → Zero-DCE++.
+
+    Every frame passed to `enhance()` flows through whichever stages are
+    enabled, each stage transforming the previous stage's output (not the
+    original frame independently three times).
 
     Constructor args:
-        weights_path : path to .pth file  (default: snapshots_Zero_DCE++/Epoch99.pth)
-        scale_factor : downscale factor for inference speed
-                       1  = full resolution  (best quality, slower)
-                       12 = paper default    (fast, used in lowlight_test.py)
-        device       : "auto" | "cpu" | "cuda" | "cuda:0"
+        weights_path          : path to Zero-DCE++ .pth file.
+        scale_factor           : Zero-DCE++ internal downscale factor
+                                  (1 = full res/slow/best, 12 = paper default).
+        device                 : "auto" | "cpu" | "cuda" | "cuda:0".
 
-    If the weights file is missing the enhancer gracefully falls back to CLAHE
-    and prints a warning — the pipeline never crashes.
+        enable_gamma           : run adaptive Gamma Correction stage.  (default True)
+        enable_clahe            : run CLAHE stage.                      (default True)
+        enable_zero_dce         : run Zero-DCE++ CNN stage.             (default True)
+
+        gamma_target_mean       : target mean luminance (0-255) the adaptive
+                                   gamma stage aims for.
+        clahe_clip_limit        : CLAHE contrast clip threshold.
+        clahe_tile_grid_size    : CLAHE tile grid size.
+
+    If `enable_zero_dce=True` but the weights file is missing/broken, that
+    stage is skipped automatically (warning printed once at startup) — the
+    gamma and CLAHE stages still run, so the pipeline never crashes for
+    lack of model weights.
     """
 
     def __init__(
         self,
-        weights_path : str = _WEIGHTS,
-        scale_factor : int = 12,
-        device       : str = "cpu",
+        weights_path          : str   = _WEIGHTS,
+        scale_factor            : int   = 12,
+        device                  : str   = "cpu",
+        enable_gamma             : bool  = True,
+        enable_clahe             : bool  = True,
+        enable_zero_dce          : bool  = True,
+        gamma_target_mean        : float = 128.0,
+        clahe_clip_limit         : float = 3.0,
+        clahe_tile_grid_size     : tuple = (8, 8),
     ):
         self.scale_factor = scale_factor
         self.device       = self._resolve_device(device)
-        self._model       = None       # lazy-loaded on first call if needed
-        self._fallback    = False      # True → weights missing, use CLAHE
+        self._model       = None
 
-        self._load_model(weights_path)
+        self.enable_gamma     = enable_gamma
+        self.enable_clahe     = enable_clahe
+        self.enable_zero_dce  = enable_zero_dce   # requested state
+        self._zero_dce_ready  = False              # actual state (weights loaded ok?)
+
+        self.gamma_target_mean    = gamma_target_mean
+        self.clahe_clip_limit     = clahe_clip_limit
+        self.clahe_tile_grid_size = clahe_tile_grid_size
+
+        # Per-frame diagnostics, updated on every enhance() call
+        self.last_gamma           : float | None = None
+        self.last_stages_applied  : list[str]     = []
+
+        if self.enable_zero_dce:
+            self._load_model(weights_path)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def enhance(self, frame: np.ndarray) -> np.ndarray:
         """
-        Enhance a single low-light BGR frame.
+        Run the frame through every enabled stage, in order:
+            Gamma Correction → CLAHE → Zero-DCE++
+
+        Each stage's output becomes the next stage's input.
 
         Args:
             frame : BGR numpy array from OpenCV  (any resolution)
@@ -102,37 +150,65 @@ class ZeroDCEEnhancer:
         Returns:
             Enhanced BGR numpy array  (same resolution as input)
         """
-        # ── Save original dimensions ──────────────────────────────────────────
-        # Zero-DCE++ pads the frame to a scale_factor multiple before running
-        # the CNN, then crops it back.  Floating-point rounding in that
-        # pad/crop cycle can leave the output 1-2 px off from the input, which
-        # causes ByteTrack's GMC (Lucas-Kanade pyramid) to throw an assertion
-        # error when the previous and current frame sizes don't match.
         orig_h, orig_w = frame.shape[:2]
+        working = frame
+        stages_applied: list[str] = []
+        self.last_gamma = None
 
-        # ── Run enhancement ───────────────────────────────────────────────────
-        if self._fallback:
-            result = _clahe_enhance(frame)
-        else:
-            result = self._zero_dce_enhance(frame)
+        # ── Stage 1: Gamma Correction (global exposure) ────────────────────────
+        if self.enable_gamma:
+            gamma = estimate_gamma(working, target_mean=self.gamma_target_mean)
+            working = gamma_correction(working, gamma=gamma)
+            self.last_gamma = round(gamma, 3)
+            stages_applied.append("gamma")
 
-        # ── Guarantee exact size match ────────────────────────────────────────
-        # Applies even on the CLAHE path: if the input somehow had an odd
-        # dimension that CLAHE's internal tiling rounded, we still get back
-        # the exact (orig_w, orig_h) the caller gave us.
-        if result.shape[:2] != (orig_h, orig_w):
-            result = cv2.resize(
-                result,
+        # ── Stage 2: CLAHE (local contrast) ─────────────────────────────────────
+        if self.enable_clahe:
+            working = clahe_enhance(
+                working,
+                clip_limit=self.clahe_clip_limit,
+                tile_grid_size=self.clahe_tile_grid_size,
+            )
+            stages_applied.append("clahe")
+
+        # ── Stage 3: Zero-DCE++ (deep refinement) ────────────────────────────────
+        # NOTE: Zero-DCE++ pads to a scale_factor multiple internally, then crops
+        # back — floating point rounding in that pad/crop cycle can leave the
+        # output 1-2px off from its input, which is why every stage re-checks
+        # size at the end regardless of which stages ran.
+        if self.enable_zero_dce and self._zero_dce_ready:
+            working = self._zero_dce_enhance(working)
+            stages_applied.append("zero_dce")
+
+        self.last_stages_applied = stages_applied
+
+        # ── Guarantee exact size match on the final output ─────────────────────
+        if working.shape[:2] != (orig_h, orig_w):
+            working = cv2.resize(
+                working,
                 (orig_w, orig_h),           # cv2.resize takes (width, height)
                 interpolation=cv2.INTER_LINEAR,
             )
 
-        return result
+        return working
 
     @property
     def method(self) -> str:
-        """Return which enhancement backend is active."""
-        return "clahe" if self._fallback else "zero_dce++"
+        """
+        Human-readable summary of what actually ran on the last frame, e.g.
+        "gamma[1.62]+clahe+zero_dce" or "gamma[2.1]+clahe" if zero_dce weights
+        are unavailable. Kept as `method` (not `stages_applied`) for backward
+        compatibility with callers that read `enhancer.method`.
+        """
+        if not self.last_stages_applied:
+            return "none"
+        parts = []
+        for stage in self.last_stages_applied:
+            if stage == "gamma" and self.last_gamma is not None:
+                parts.append(f"gamma[{self.last_gamma}]")
+            else:
+                parts.append(stage)
+        return "+".join(parts)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -140,8 +216,9 @@ class ZeroDCEEnhancer:
         """Load the Zero-DCE++ network and pretrained weights."""
         if not os.path.isfile(weights_path):
             print(f"[ZeroDCE] WARNING: weights not found at {weights_path}")
-            print(f"[ZeroDCE] Falling back to CLAHE enhancement.")
-            self._fallback = True
+            print(f"[ZeroDCE] Zero-DCE++ stage will be SKIPPED — "
+                  f"gamma/CLAHE stages still run.")
+            self._zero_dce_ready = False
             return
 
         try:
@@ -149,13 +226,15 @@ class ZeroDCEEnhancer:
             state_dict  = torch.load(weights_path, map_location=self.device)
             self._model.load_state_dict(state_dict)
             self._model.eval()
+            self._zero_dce_ready = True
             print(f"[ZeroDCE] Model loaded — scale_factor={self.scale_factor}, "
                   f"device={self.device}, weights={os.path.basename(weights_path)}")
         except Exception as e:
             print(f"[ZeroDCE] Failed to load model: {e}")
-            print(f"[ZeroDCE] Falling back to CLAHE enhancement.")
-            self._fallback = True
-            self._model    = None
+            print(f"[ZeroDCE] Zero-DCE++ stage will be SKIPPED — "
+                  f"gamma/CLAHE stages still run.")
+            self._zero_dce_ready = False
+            self._model = None
 
     def _zero_dce_enhance(self, frame: np.ndarray) -> np.ndarray:
         """
