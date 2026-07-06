@@ -141,6 +141,9 @@ class VehicleDetector:
         if self.enable_tracking:
             raw = self.model.track(
                 frame,
+                tracker = "bytetrack.yaml",  # ByteTrack has no GMC/optical-flow step;
+                                             # avoids "GMC failed" lkpyramid errors when
+                                             # consecutive frame sizes differ (BoT-SORT default)
                 classes = self.class_ids,
                 conf    = self.conf_threshold,
                 iou     = self.iou_threshold,

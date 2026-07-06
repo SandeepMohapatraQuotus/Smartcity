@@ -75,13 +75,16 @@ export interface FaceResult {
 }
 
 export interface AlertEvent {
-  type: "face_watchlist_hit";
+  type: "face_watchlist_hit" | "person_registry_hit";
   person_id: string;
   name: string;
   similarity: number;
   frame_id: string;
   camera_id: string;
   timestamp: number;
+  // person_registry_hit extras
+  method?: "face" | "body";
+  track_id?: number;
 }
 
 export interface FrameEvent {
@@ -94,6 +97,7 @@ export interface FrameEvent {
   persons: PersonDetectionResult;
   plates: ANPRResult;
   faces: FaceResult[];
+  identified_people: IdentifiedPerson[];
   alerts: AlertEvent[];
 }
 
@@ -114,4 +118,31 @@ export interface ServerStatus {
   status: "ready" | "loading";
   uptime: number;
   models: string[];
+}
+
+// ── Person Registry ────────────────────────────────────────────────
+
+export interface RegistryPerson {
+  person_id: string;
+  name: string;
+  face_refs: number;
+  body_refs: number;
+}
+
+export interface AddPersonOutcome {
+  person_id: string;
+  name: string;
+  images_received: number;
+  face_embeddings_added: number;
+  body_embeddings_added: number;
+  images_skipped: number;
+  status: "ok" | "warning_no_usable_images";
+}
+
+export interface IdentifiedPerson {
+  track_id: number;
+  person_id: string;
+  name: string;
+  similarity: number;
+  method: "face" | "body";
 }

@@ -9,7 +9,10 @@ import type {
   WatchlistPerson,
   StreamStatus,
   ServerStatus,
+  RegistryPerson,
+  AddPersonOutcome,
 } from "./types";
+
 
 function fileForm(file: File, extra?: Record<string, string>) {
   const fd = new FormData();
@@ -97,3 +100,18 @@ export const getAlerts = (limit = 100) =>
   api.get<{ total: number; alerts: AlertEvent[] }>(`/alerts?limit=${limit}`).then((r) => r.data.alerts);
 
 export const clearBuffers = () => api.delete("/events").then((r) => r.data);
+
+// ── Person Registry ───────────────────────────────────────────────
+export const addRegistryPerson = (name: string, images: File[]) => {
+  const fd = new FormData();
+  fd.append("name", name);
+  for (const img of images) fd.append("images", img);
+  return api.post<AddPersonOutcome>("/person/add", fd).then((r) => r.data);
+};
+
+export const removeRegistryPerson = (person_id: string) =>
+  api.delete(`/person/${person_id}`).then((r) => r.data);
+
+export const listRegistryPeople = () =>
+  api.get<{ people: RegistryPerson[] }>("/person").then((r) => r.data.people);
+

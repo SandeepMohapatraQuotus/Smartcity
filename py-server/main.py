@@ -17,7 +17,9 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional
-
+from fastapi import UploadFile, File, Form
+from typing import List
+import traceback
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
@@ -474,9 +476,170 @@ async def dehaze_frame_compare(
         },
     )
 
+@app.post("/person/add")
+async def add_person(name: str = Form(...), images: List[UploadFile] = File(...)):
+    """
+    Register a person by name using one or more reference images.
+    Images can be clear face photos, full-body/CCTV shots, or a mix.
+    For each image: a face embedding is stored if a face is found,
+    and a body Re-ID embedding is stored if a person is detected.
+    An image only counts as 'skipped' if neither succeeds.
+    """
+    decoded_images = []
+    for upload in images:
+        raw = await upload.read()
+        frame = _decode_bytes(raw)
+        if frame is not None:
+            decoded_images.append(frame)
+ 
+    if not decoded_images:
+        return {"error": "No valid images could be decoded."}
+ 
+    outcome = pipeline.person_registry.add_person(
+        name=name,
+        images=decoded_images,
+        face_recogniser=pipeline.recogniser,
+        person_detector=pipeline.person_detector,
+        reidentifier=pipeline.reidentifier,
+    )
 
+    if outcome.registry_unavailable:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Person registry is unavailable: pgvector extension is not installed "
+                "on the PostgreSQL server. "
+                "Run: sudo apt install postgresql-17-pgvector "
+                "then re-run pgvector_setup.sql and restart the server."
+            ),
+        )
+
+    status = "ok" if (outcome.face_embeddings_added or outcome.body_embeddings_added) else "warning_no_usable_images"
+    return {
+        "person_id": outcome.person_id,
+        "name": outcome.name,
+        "images_received": outcome.images_received,
+        "face_embeddings_added": outcome.face_embeddings_added,
+        "body_embeddings_added": outcome.body_embeddings_added,
+        "images_skipped": outcome.images_skipped,
+        "status": status,
+        "errors": outcome.errors if status != "ok" else [],
+    }
+ 
+ 
+@app.delete("/person/{person_id}")
+async def remove_person(person_id: str):
+    removed = pipeline.person_registry.remove(person_id)
+    if not removed:
+        return {"error": f"No person found with id {person_id}"}
+    return {"status": "removed", "person_id": person_id}
+ 
+ 
+@app.get("/person")
+async def list_people():
+    return {"people": pipeline.person_registry.list_people()}
+
+
+# =====================================================================
+# CORRECTED DEBUG ROUTE — uses pipeline.recogniser.recognise(...) and
+# pipeline.watchlist, matching the real pipeline.py attribute names.
+# =====================================================================
+@app.get("/person/debug_status")
+async def debug_registry_status():
+    """
+    Reports whether PersonRegistry actually has a live DB connection right
+    now. If '_available' is False, every match silently returns null/0.0
+    with no visible error — this endpoint exposes that hidden state.
+    """
+    reg = pipeline.person_registry
+    print(f"DEBUG debug_status: id(reg)={id(reg)}, id(reg._conn)={id(reg._conn)}")
+    status = {"available": reg._available}
+    if reg._available:
+        try:
+            with reg._conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM persons")
+                status["persons_count"] = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM face_embeddings")
+                status["face_embeddings_count"] = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM body_embeddings")
+                status["body_embeddings_count"] = cur.fetchone()[0]
+                cur.execute("SELECT current_database()")
+                status["connected_database"] = cur.fetchone()[0]
+        except Exception as e:
+            status["query_error"] = str(e)
+    else:
+        status["reason"] = "Connection failed at startup — check server console logs for the PersonRegistry warning printed when SmartCityPipeline() was constructed."
+    return status
+@app.post("/person/debug_match_all")
+async def debug_match_all_faces(image: UploadFile = File(...)):
+    """
+    Upload a test image (can contain multiple people). Returns the raw
+    similarity score for EVERY face detected in the image against the
+    person_registry, plus every detected person's body match. No threshold
+    filtering — shows the real numbers.
+    """
+    raw = await image.read()
+    frame = _decode_bytes(raw)
+    if frame is None:
+        return {"error": "Could not decode image."}
+
+    output = {"faces": [], "bodies": []}
+
+    # --- Check every face in the image ---
+    try:
+        face_results = pipeline.recogniser.recognise(
+            frame, pipeline.watchlist, "debug", "debug"
+        )
+        for i, fr in enumerate(face_results or []):
+            entry = {
+                "face_index": i,
+                "bbox": list(fr.face.bbox),
+                "detection_confidence": float(fr.face.confidence),
+            }
+            print(f"DEBUG: embedding type={type(fr.face.embedding)}, len={len(fr.face.embedding) if fr.face.embedding is not None else 'None'}")
+
+            if fr.face.embedding is not None:
+                print(f"DEBUG: dtype={fr.face.embedding.dtype if hasattr(fr.face.embedding, 'dtype') else 'no dtype attr'}")
+                print(f"DEBUG: first 5 values={fr.face.embedding[:5]}")
+                print(f"DEBUG: is all zeros={all(v == 0 for v in fr.face.embedding[:10])}")
+
+                raw_person, raw_sim = pipeline.person_registry._match(
+                    "face_embeddings", fr.face.embedding, threshold=-1.0
+                )
+                entry["best_match"] = raw_person
+                entry["similarity"] = raw_sim
+                entry["would_pass_threshold"] = raw_sim >= pipeline.person_registry.face_sim_threshold
+            output["faces"].append(entry)
+    except Exception as e:
+        output["face_error"] = str(e)
+        output["face_error_type"] = type(e).__name__
+        output["face_error_trace"] = traceback.format_exc()
+
+    # --- Check every detected person's body ---
+    try:
+        det_result = pipeline.person_detector.detect(frame, frame_id="debug", camera_id="debug")
+        for i, det in enumerate(getattr(det_result, "detections", [])):
+            x1, y1, x2, y2 = det.bbox
+            crop = frame[int(y1):int(y2), int(x1):int(x2)]
+            vec = pipeline.reidentifier.embed(crop)
+            entry = {"person_index": i, "bbox": list(det.bbox)}
+            if vec is not None:
+                raw_person, raw_sim = pipeline.person_registry._match(
+                    "body_embeddings", vec, threshold=-1.0
+                )
+                entry["best_match"] = raw_person
+                entry["similarity"] = raw_sim
+                entry["would_pass_threshold"] = raw_sim >= pipeline.person_registry.body_sim_threshold
+            else:
+                entry["error"] = "reidentifier returned None (empty/invalid crop?)"
+            output["bodies"].append(entry)
+    except Exception as e:
+        output["face_error"] = str(e)
+        output["face_error_type"] = type(e).__name__
+        output["face_error_trace"] = traceback.format_exc()
+
+    return output
 # ─── Stream ───────────────────────────────────────────────────────────────────
-
 async def _stream_worker(source: str, camera_id: str):
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -562,11 +725,33 @@ def _draw_all(frame: np.ndarray, event: "FrameEvent") -> np.ndarray:
         annotated = pipeline.vehicles.draw(annotated, event.vehicles)
     if event.persons:
         annotated = pipeline.person_detector.draw(annotated, event.persons)
+
+    # ── Overlay identified person names ──────────────────────────────
+    if event.identified_people and event.persons:
+        id_by_track = {p["track_id"]: p for p in event.identified_people}
+        for det in event.persons.detections:
+            identity = id_by_track.get(det.track_id)
+            if not identity:
+                continue
+            x1, y1 = det.bbox[0], det.bbox[1]
+            method  = identity.get("method", "")
+            name    = identity["name"]
+            sim     = identity["similarity"]
+            label   = f"{name}  {sim:.2f}  [{method}]"
+            # green for face match, cyan for body match
+            color = (0, 230, 80) if method == "face" else (0, 220, 255)
+            # dark backing bar so text is readable on any background
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.rectangle(annotated, (x1, y1 - th - 14), (x1 + tw + 8, y1 - 2), (20, 20, 20), -1)
+            cv2.putText(annotated, label, (x1 + 4, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
     if event.plates:
         annotated = pipeline.anpr.draw(annotated, event.plates)
     if event.faces:
         annotated = pipeline.recogniser.draw(annotated, event.faces)
     return annotated
+
 
 
 def _open_capture(source: str) -> cv2.VideoCapture:

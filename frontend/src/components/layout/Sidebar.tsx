@@ -11,6 +11,7 @@ import {
   Users,
   Bell,
   Building2,
+  UserSearch,
 } from "lucide-react";
 import {
   Sidebar,
@@ -69,6 +70,7 @@ const groups: { label: string; items: NavItem[] }[] = [
     items: [
       { title: "Day / Night", url: "/classify", icon: Sun, method: "POST" },
       { title: "Detect", url: "/detect", icon: Car, method: "POST" },
+      { title: "Persons & Registry", url: "/persons", icon: UserSearch, method: "POST" },
     ],
   },
   {

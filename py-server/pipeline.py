@@ -12,6 +12,8 @@ from clashifiers.person_detector.main   import PersonDetector, PersonDetectionRe
 from services.zero_dce  import ZeroDCEEnhancer
 from services.anpr      import ANPRService, ANPRResult
 from services.dehazing  import DehazingService
+from clashifiers.person_reid.main import PersonReIdentifier
+from pg_vector import PersonRegistry
 
 
 # ─── Frame Event ──────────────────────────────────────────────────────────────
@@ -31,6 +33,7 @@ class FrameEvent:
     persons   : Optional[PersonDetectionResult]  = None
     plates    : Optional[ANPRResult]             = None
     faces     : list[FaceResult]                 = field(default_factory=list)
+    identified_people: list[dict]                = field(default_factory=list)
     alerts    : list[dict]                       = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -44,6 +47,7 @@ class FrameEvent:
             "persons":   self.persons.to_dict()  if self.persons  else None,
             "plates":    self.plates.to_dict()   if self.plates   else None,
             "faces":     [f.to_dict() for f in self.faces],
+            "identified_people": self.identified_people,
             "alerts":    self.alerts,
         }
 
@@ -67,7 +71,10 @@ class SmartCityPipeline:
         face_ctx_id         : int   = -1,        # -1 = CPU, 0 = GPU
         day_night_weights   : Optional[str] = None,
         watchlist_path      : Optional[str] = None,
-        face_sim_threshold  : float = 0.55,
+        face_sim_threshold  : float = 0.70,
+        body_sim_threshold  : float = 0.60,
+        person_registry_path: Optional[str] = "person_registry.json",
+        reid_device         : str   = "cpu",
         # ── Performance knobs ──────────────────────────────────────────────────
         anpr_interval       : int   = 5,     # run ANPR every N frames (0 = every frame)
         inference_max_side  : int   = 960,   # resize longer edge to this before inference
@@ -94,6 +101,18 @@ class SmartCityPipeline:
     ):
         self.camera_id = camera_id
         self._frame_idx = 0
+        
+        self.face_sim_threshold = face_sim_threshold
+        self.body_sim_threshold = body_sim_threshold
+        self.person_registry_path = person_registry_path
+        self.reid_device = reid_device
+        
+        self.reidentifier = PersonReIdentifier(device=self.reid_device)
+        self.person_registry = PersonRegistry(
+           dsn="postgresql://postgres:Quotus%401234@localhost:5432/smart_city",
+           face_sim_threshold=self.face_sim_threshold,
+           body_sim_threshold=self.body_sim_threshold,
+        )
 
         # ANPR throttle state
         self._anpr_interval    = anpr_interval
@@ -214,7 +233,7 @@ class SmartCityPipeline:
         self._frame_idx += 1
         frame_id  = f"frame_{self._frame_idx:06d}"
         timestamp = time.time()
-
+        identified_people = []
         # ── 1. Day / Night ────────────────────────────────────────────────────
         dn       = self.day_night.predict(frame)
         working  = frame
@@ -279,6 +298,48 @@ class SmartCityPipeline:
             if fr.match and fr.match.is_match
         ]
 
+        # ── 6. Person Registry Match ──────────────────────────────────────────
+        for person_det in person_result.detections:
+            x1, y1, x2, y2 = person_det.bbox
+            person_crop = infer_frame[int(y1):int(y2), int(x1):int(x2)]
+
+            if person_crop.size == 0:
+                continue
+
+            # Try to find a face that falls inside this person's bbox
+            matching_face = None
+            for face in face_results:
+                fx1, fy1, fx2, fy2 = face.face.bbox
+                face_cx, face_cy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                if x1 <= face_cx <= x2 and y1 <= face_cy <= y2:
+                    matching_face = face
+                    break
+
+            face_embedding = matching_face.face.embedding if matching_face else None
+            body_embedding = self.reidentifier.embed(person_crop)
+
+            identity = self.person_registry.identify(
+                face_embedding=face_embedding,
+                body_embedding=body_embedding,
+            )
+
+            if identity:
+                identified_people.append({
+                    "track_id": person_det.track_id,
+                    **identity,
+                })
+                alerts.append({
+                    "type": "person_registry_hit",
+                    "person_id": identity["person_id"],
+                    "name": identity["name"],
+                    "similarity": identity["similarity"],
+                    "method": identity["method"],
+                    "track_id": person_det.track_id,
+                    "frame_id": frame_id,
+                    "camera_id": self.camera_id,
+                    "timestamp": timestamp,
+                })
+
         return FrameEvent(
             frame_id  = frame_id,
             camera_id = self.camera_id,
@@ -289,6 +350,7 @@ class SmartCityPipeline:
             persons   = person_result,
             plates    = anpr_result,
             faces     = face_results,
+            identified_people = identified_people,
             alerts    = alerts,
         )
 

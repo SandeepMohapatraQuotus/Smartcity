@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as WatchlistRouteImport } from './routes/watchlist'
 import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
+import { Route as PersonsRouteImport } from './routes/persons'
 import { Route as EventsRouteImport } from './routes/events'
 import { Route as DetectRouteImport } from './routes/detect'
 import { Route as DehazeRouteImport } from './routes/dehaze'
@@ -27,6 +28,11 @@ const WatchlistRoute = WatchlistRouteImport.update({
 const SitemapDotxmlRoute = SitemapDotxmlRouteImport.update({
   id: '/sitemap.xml',
   path: '/sitemap.xml',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PersonsRoute = PersonsRouteImport.update({
+  id: '/persons',
+  path: '/persons',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EventsRoute = EventsRouteImport.update({
@@ -73,6 +79,7 @@ export interface FileRoutesByFullPath {
   '/dehaze': typeof DehazeRoute
   '/detect': typeof DetectRoute
   '/events': typeof EventsRoute
+  '/persons': typeof PersonsRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/watchlist': typeof WatchlistRoute
 }
@@ -84,6 +91,7 @@ export interface FileRoutesByTo {
   '/dehaze': typeof DehazeRoute
   '/detect': typeof DetectRoute
   '/events': typeof EventsRoute
+  '/persons': typeof PersonsRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/watchlist': typeof WatchlistRoute
 }
@@ -96,6 +104,7 @@ export interface FileRoutesById {
   '/dehaze': typeof DehazeRoute
   '/detect': typeof DetectRoute
   '/events': typeof EventsRoute
+  '/persons': typeof PersonsRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/watchlist': typeof WatchlistRoute
 }
@@ -109,6 +118,7 @@ export interface FileRouteTypes {
     | '/dehaze'
     | '/detect'
     | '/events'
+    | '/persons'
     | '/sitemap.xml'
     | '/watchlist'
   fileRoutesByTo: FileRoutesByTo
@@ -120,6 +130,7 @@ export interface FileRouteTypes {
     | '/dehaze'
     | '/detect'
     | '/events'
+    | '/persons'
     | '/sitemap.xml'
     | '/watchlist'
   id:
@@ -131,6 +142,7 @@ export interface FileRouteTypes {
     | '/dehaze'
     | '/detect'
     | '/events'
+    | '/persons'
     | '/sitemap.xml'
     | '/watchlist'
   fileRoutesById: FileRoutesById
@@ -143,6 +155,7 @@ export interface RootRouteChildren {
   DehazeRoute: typeof DehazeRoute
   DetectRoute: typeof DetectRoute
   EventsRoute: typeof EventsRoute
+  PersonsRoute: typeof PersonsRoute
   SitemapDotxmlRoute: typeof SitemapDotxmlRoute
   WatchlistRoute: typeof WatchlistRoute
 }
@@ -161,6 +174,13 @@ declare module '@tanstack/react-router' {
       path: '/sitemap.xml'
       fullPath: '/sitemap.xml'
       preLoaderRoute: typeof SitemapDotxmlRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/persons': {
+      id: '/persons'
+      path: '/persons'
+      fullPath: '/persons'
+      preLoaderRoute: typeof PersonsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/events': {
@@ -223,6 +243,7 @@ const rootRouteChildren: RootRouteChildren = {
   DehazeRoute: DehazeRoute,
   DetectRoute: DetectRoute,
   EventsRoute: EventsRoute,
+  PersonsRoute: PersonsRoute,
   SitemapDotxmlRoute: SitemapDotxmlRoute,
   WatchlistRoute: WatchlistRoute,
 }
