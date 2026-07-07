@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ─── Data Classes ─────────────────────────────────────────────────────────────
 
 @dataclass
 class PersonDetection:

@@ -64,14 +64,13 @@ export interface WatchlistMatch {
   is_match: boolean;
 }
 
-export interface FaceResult {
-  face: {
-    bbox: [number, number, number, number];
-    confidence: number;
-    landmarks: number[][];
-  };
-  match: WatchlistMatch | null;
-  alert: boolean;
+// Face detection result shape from POST /analyse/frame (pipeline.process_frame)
+// faces is now a plain dict — best_match comes from pgvector, not Watchlist
+export interface FaceDetection {
+  bbox: [number, number, number, number];
+  confidence: number;
+  best_match: { person_id: string; name: string } | null;
+  similarity: number;
 }
 
 export interface AlertEvent {
@@ -82,7 +81,6 @@ export interface AlertEvent {
   frame_id: string;
   camera_id: string;
   timestamp: number;
-  // person_registry_hit extras
   method?: "face" | "body";
   track_id?: number;
 }
@@ -96,9 +94,34 @@ export interface FrameEvent {
   vehicles: VehicleDetectionResult;
   persons: PersonDetectionResult;
   plates: ANPRResult;
-  faces: FaceResult[];
+  faces: FaceDetection[];          // was FaceResult[] — format changed in pipeline.py
   identified_people: IdentifiedPerson[];
   alerts: AlertEvent[];
+}
+
+// ── /analyse/identify response shape ──────────────────────────────────
+export interface IdentifyPersonResult {
+  track_id: number | null;
+  body_bbox: [number, number, number, number];
+  face_bbox: [number, number, number, number] | null;
+  person_id: string | null;
+  name: string | null;
+  similarity: number | null;
+  method: "face" | "body" | null;
+}
+
+export interface IdentifyResult {
+  frame_id: string;
+  camera_id: string;
+  person_count: number;
+  people: IdentifyPersonResult[];
+  unbound_faces: Array<{
+    bbox: [number, number, number, number];
+    confidence: number;
+    person_id: string | null;
+    name: string | null;
+    similarity: number | null;
+  }>;
 }
 
 export interface WatchlistPerson {
@@ -136,7 +159,9 @@ export interface AddPersonOutcome {
   face_embeddings_added: number;
   body_embeddings_added: number;
   images_skipped: number;
-  status: "ok" | "warning_no_usable_images";
+  reused_existing_person: boolean;
+  note: string;
+  errors: string[];
 }
 
 export interface IdentifiedPerson {

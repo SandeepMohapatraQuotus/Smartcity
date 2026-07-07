@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from PIL import Image, UnidentifiedImageError
 
 from pipeline import SmartCityPipeline, FrameEvent
+from clashifiers.identity_resolver import IdentityResolver
 
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
@@ -159,11 +160,11 @@ def _decode_b64(b64: str) -> np.ndarray:
         raise HTTPException(status_code=400, detail="Invalid base64 image data.")
 
 def _serialise(event: FrameEvent) -> dict:
-    """Convert FrameEvent → JSON-safe dict (strips numpy embeddings)."""
-    d = event.to_dict()
-    for face_rec in d.get("faces", []):
-        face_rec.get("face", {}).pop("embedding", None)
-    return d
+    """Convert FrameEvent → JSON-safe dict.
+    faces is now a list of plain dicts (no nested numpy embeddings) so no
+    stripping step is needed here any more.
+    """
+    return event.to_dict()
 
 def _store(event: FrameEvent):
     d = _serialise(event)
@@ -573,10 +574,10 @@ async def debug_registry_status():
 @app.post("/person/debug_match_all")
 async def debug_match_all_faces(image: UploadFile = File(...)):
     """
-    Upload a test image (can contain multiple people). Returns the raw
-    similarity score for EVERY face detected in the image against the
-    person_registry, plus every detected person's body match. No threshold
-    filtering — shows the real numbers.
+    Upload a test image (can contain multiple people). Only returns faces
+    and bodies where a registered person was actually matched (i.e. passed
+    the similarity threshold). Non-matches are silently dropped — bbox is
+    only included when there's a real match.
     """
     raw = await image.read()
     frame = _decode_bytes(raw)
@@ -587,29 +588,25 @@ async def debug_match_all_faces(image: UploadFile = File(...)):
 
     # --- Check every face in the image ---
     try:
-        face_results = pipeline.recogniser.recognise(
-            frame, pipeline.watchlist, "debug", "debug"
-        )
-        for i, fr in enumerate(face_results or []):
-            entry = {
-                "face_index": i,
-                "bbox": list(fr.face.bbox),
-                "detection_confidence": float(fr.face.confidence),
-            }
-            print(f"DEBUG: embedding type={type(fr.face.embedding)}, len={len(fr.face.embedding) if fr.face.embedding is not None else 'None'}")
+        detected_faces = pipeline.recogniser.detect(frame)
+        for i, face in enumerate(detected_faces or []):
+            if face.embedding is None:
+                continue
 
-            if fr.face.embedding is not None:
-                print(f"DEBUG: dtype={fr.face.embedding.dtype if hasattr(fr.face.embedding, 'dtype') else 'no dtype attr'}")
-                print(f"DEBUG: first 5 values={fr.face.embedding[:5]}")
-                print(f"DEBUG: is all zeros={all(v == 0 for v in fr.face.embedding[:10])}")
+            raw_person, raw_sim = pipeline.person_registry._match(
+                "face_embeddings",
+                face.embedding,
+                threshold=pipeline.person_registry.face_sim_threshold,
+            )
 
-                raw_person, raw_sim = pipeline.person_registry._match(
-                    "face_embeddings", fr.face.embedding, threshold=-1.0
-                )
-                entry["best_match"] = raw_person
-                entry["similarity"] = raw_sim
-                entry["would_pass_threshold"] = raw_sim >= pipeline.person_registry.face_sim_threshold
-            output["faces"].append(entry)
+            if raw_person is not None:
+                output["faces"].append({
+                    "face_index": i,
+                    "bbox": list(face.bbox),
+                    "detection_confidence": float(face.confidence),
+                    "best_match": raw_person,
+                    "similarity": raw_sim,
+                })
     except Exception as e:
         output["face_error"] = str(e)
         output["face_error_type"] = type(e).__name__
@@ -622,24 +619,29 @@ async def debug_match_all_faces(image: UploadFile = File(...)):
             x1, y1, x2, y2 = det.bbox
             crop = frame[int(y1):int(y2), int(x1):int(x2)]
             vec = pipeline.reidentifier.embed(crop)
-            entry = {"person_index": i, "bbox": list(det.bbox)}
-            if vec is not None:
-                raw_person, raw_sim = pipeline.person_registry._match(
-                    "body_embeddings", vec, threshold=-1.0
-                )
-                entry["best_match"] = raw_person
-                entry["similarity"] = raw_sim
-                entry["would_pass_threshold"] = raw_sim >= pipeline.person_registry.body_sim_threshold
-            else:
-                entry["error"] = "reidentifier returned None (empty/invalid crop?)"
-            output["bodies"].append(entry)
-    except Exception as e:
-        output["face_error"] = str(e)
-        output["face_error_type"] = type(e).__name__
-        output["face_error_trace"] = traceback.format_exc()
+            if vec is None:
+                continue
 
-    return output
-# ─── Stream ───────────────────────────────────────────────────────────────────
+            raw_person, raw_sim = pipeline.person_registry._match(
+                "body_embeddings",
+                vec,
+                threshold=pipeline.person_registry.body_sim_threshold,
+            )
+
+            # Only keep this body if it actually passed the threshold
+            if raw_person is not None:
+                output["bodies"].append({
+                    "person_index": i,
+                    "bbox": list(det.bbox),
+                    "best_match": raw_person,
+                    "similarity": raw_sim,
+                })
+    except Exception as e:
+        output["body_error"] = str(e)
+        output["body_error_type"] = type(e).__name__
+        output["body_error_trace"] = traceback.format_exc()
+
+    return output# ─── Stream ───────────────────────────────────────────────────────────────────
 async def _stream_worker(source: str, camera_id: str):
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -746,10 +748,16 @@ def _draw_all(frame: np.ndarray, event: "FrameEvent") -> np.ndarray:
             cv2.putText(annotated, label, (x1 + 4, y1 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-    if event.plates:
-        annotated = pipeline.anpr.draw(annotated, event.plates)
-    if event.faces:
-        annotated = pipeline.recogniser.draw(annotated, event.faces)
+    # ── Face boxes (now plain dicts, not FaceResult objects) ─────────
+    for f in event.faces:
+        x1, y1, x2, y2 = f["bbox"]
+        is_alert = f["best_match"] is not None
+        color = (0, 0, 255) if is_alert else (0, 255, 0)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        label = (f"{f['best_match']['name']} ({f['similarity']:.2f})"
+                 if is_alert else f"Unknown ({f['confidence']:.2f})")
+        cv2.putText(annotated, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     return annotated
 
 
@@ -888,38 +896,142 @@ def stream_sources():
 
 @app.post("/watchlist/add", tags=["Watchlist"])
 async def watchlist_add(
-    person_id : str        = Form(..., description="Unique person ID  e.g. P001"),
-    name      : str        = Form(..., description="Display name"),
-    photo     : UploadFile = File(..., description="Reference face photo (JPEG / PNG)"),
+    name      : str                 = Form(..., description="Display name  e.g. 'Sandeep'"),
+    person_id : Optional[str]       = Form(None, description="Existing person_id to add more photos to (optional)"),
+    files     : List[UploadFile]    = File(..., description="One or more reference face / body photos (JPEG / PNG)"),
 ):
     """
-    Add a person to the face watchlist.
+    Add or update a person on the **face watchlist AND person registry**.
+
+    Accepts **multiple reference photos in a single call** — this is important:
+    if the frontend uploads N photos by calling this endpoint N times (one
+    photo each), and doesn’t carry the returned `person_id` across calls, each
+    call previously minted a fresh UUID, producing N duplicate personas.
+
+    Fix: upload all photos in **one** multipart call.  Or, on subsequent calls,
+    pass back the `person_id` returned by the first call.
+
+    Deduplication: if no `person_id` is supplied and a person with the same
+    `name` (case-insensitive) already exists in the registry, the new photos
+    are merged into that existing entry instead of creating a new one.
     """
-    frame = _decode_bytes(await photo.read())
-    try:
-        pipeline.watchlist.add_from_photo(person_id, name, frame, pipeline.recogniser)
-    except (ValueError, FileNotFoundError) as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    decoded_images: list[np.ndarray] = []
+    for upload in files:
+        raw = await upload.read()
+        try:
+            frame = _decode_bytes(raw)
+            if frame is not None:
+                decoded_images.append(frame)
+        except Exception:
+            pass  # individual bad uploads are skipped; errors surface in outcome.errors
+
+    if not decoded_images:
+        raise HTTPException(status_code=422, detail="No valid images could be decoded from the uploaded files.")
+
+    # ── Register in the full PersonRegistry (pgvector) ───────────────────────
+    outcome = pipeline.person_registry.add_person(
+        name=name,
+        images=decoded_images,
+        face_recogniser=pipeline.recogniser,
+        person_detector=pipeline.person_detector,
+        reidentifier=pipeline.reidentifier,
+        person_id=person_id,
+    )
+
+    if outcome.registry_unavailable:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Person registry unavailable: pgvector extension not installed. "
+                "Run: sudo apt install postgresql-17-pgvector "
+                "then re-run pgvector_setup.sql and restart the server."
+            ),
+        )
+
+    # ── pgvector PersonRegistry is the only store now (Watchlist removed) ───
+    # The watchlist.add_person() call that used to live here has been removed.
+
     return {
-        "message":   f"'{name}' added to watchlist.",
-        "person_id": person_id,
-        "total":     len(pipeline.watchlist),
+        "person_id":              outcome.person_id,
+        "name":                   outcome.name,
+        "images_received":        outcome.images_received,
+        "face_embeddings_added":  outcome.face_embeddings_added,
+        "body_embeddings_added":  outcome.body_embeddings_added,
+        "images_skipped":         outcome.images_skipped,
+        "reused_existing_person": outcome.reused_existing_person,
+        "note": (
+            "Matched an existing registered person by name — merged into that "
+            "person_id instead of creating a new one."
+            if outcome.reused_existing_person else
+            "Created a new person entry."
+        ),
+        "errors": outcome.errors if outcome.images_skipped else [],
     }
+
+
+@app.post("/analyse/identify", tags=["Analysis"])
+async def analyse_identify(
+    file      : UploadFile = File(..., description="JPEG or PNG image"),
+    camera_id : str        = Form(default="cam_01"),
+):
+    """
+    Upload an image → run **IdentityResolver** → return per-person identity JSON.
+
+    Differences from `/analyse/frame`:
+      - Adaptive face detection: tries 320→640→960 detection grids until faces are found.
+      - Spatial face↔body binding: a body box inherits its face’s identity;
+        no separate body-only Re-ID vote that often misidentifies people.
+      - Body-only matching is OFF by default (cleaner results in CCTV conditions).
+
+    Response shape:
+        {
+          "frame_id": str,
+          "camera_id": str,
+          "person_count": int,
+          "people": [
+            {
+              "track_id": int|null,
+              "body_bbox": [x1,y1,x2,y2],
+              "face_bbox": [x1,y1,x2,y2]|null,
+              "person_id": str|null,
+              "name": str|null,
+              "similarity": float|null,
+              "method": "face"|"body"|null
+            }, ...
+          ],
+          "unbound_faces": [ ... ]   # faces with no body bbox match
+        }
+    """
+    frame = _decode_bytes(await file.read())
+    import time as _time
+    frame_id = f"ident_{int(_time.time()*1000)}"
+
+    resolver = IdentityResolver(
+        registry          = pipeline.person_registry,
+        face_recogniser   = pipeline.recogniser,
+        person_detector   = pipeline.person_detector,
+        reidentifier      = pipeline.reidentifier,
+        enable_body_matching = False,  # keep OFF until validated separately
+    )
+    result = await asyncio.to_thread(
+        resolver.identify_frame, frame, frame_id, camera_id
+    )
+    return JSONResponse(content=result)
 
 
 @app.delete("/watchlist/{person_id}", tags=["Watchlist"])
 async def watchlist_remove(person_id: str):
-    """Remove a person from the watchlist by their person_id."""
-    removed = pipeline.watchlist.remove(person_id)
-    if removed == 0:
+    """Remove a person from the registry by their person_id."""
+    removed = pipeline.person_registry.remove(person_id)
+    if not removed:
         raise HTTPException(status_code=404, detail=f"'{person_id}' not found.")
-    return {"message": f"Removed '{person_id}'.", "remaining": len(pipeline.watchlist)}
+    return {"message": f"Removed '{person_id}'."}
 
 
 @app.get("/watchlist", tags=["Watchlist"])
 async def watchlist_list():
-    """List all persons currently on the watchlist."""
-    people = pipeline.watchlist.list_people()
+    """List all registered persons (now backed by pgvector, not in-memory Watchlist)."""
+    people = pipeline.person_registry.list_people()
     return {"total": len(people), "people": people}
 
 

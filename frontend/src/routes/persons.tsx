@@ -48,8 +48,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
-  analyseFrame,
-  analyseFrameAnnotated,
+  analyseIdentify,
+  analyseIdentifyAnnotated,
   addRegistryPerson,
   removeRegistryPerson,
   listRegistryPeople,
@@ -57,6 +57,8 @@ import {
 import type {
   PersonDetectionResult,
   IdentifiedPerson,
+  IdentifyPersonResult,
+  IdentifyResult,
   RegistryPerson,
   AddPersonOutcome,
 } from "@/api/types";
@@ -88,24 +90,20 @@ const rowMotion = {
 function DetectTab() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<PersonDetectionResult | null>(null);
-  const [identified, setIdentified] = useState<IdentifiedPerson[]>([]);
+  const [result, setResult] = useState<IdentifyResult | null>(null);
   const [annotated, setAnnotated] = useState<Blob | null>(null);
 
   const run = async () => {
     if (!file) return toast.error("Upload an image first");
     setLoading(true);
     setResult(null);
-    setIdentified([]);
     setAnnotated(null);
     try {
-      // Run full pipeline so identified_people is populated
-      const [event, blob] = await Promise.all([
-        analyseFrame(file),
-        analyseFrameAnnotated(file),
+      const [identifyResult, blob] = await Promise.all([
+        analyseIdentify(file),
+        analyseIdentifyAnnotated(file),
       ]);
-      setResult(event.persons ?? null);
-      setIdentified(event.identified_people ?? []);
+      setResult(identifyResult);
       setAnnotated(blob);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Detection failed");
@@ -114,8 +112,11 @@ function DetectTab() {
     }
   };
 
-  // track_id → identity for O(1) lookup in the table
-  const idByTrack = new Map(identified.map((p) => [p.track_id, p]));
+  // people[] = body-detected persons (may or may not be identified)
+  // unbound_faces[] = faces found whose centre wasn't inside any body bbox
+  const identifiedWithBody = result?.people.filter((p) => p.name !== null) ?? [];
+  const identifiedFaceOnly = result?.unbound_faces.filter((f) => f.name !== null) ?? [];
+  const totalIdentified = identifiedWithBody.length + identifiedFaceOnly.length;
 
   return (
     <div className="grid gap-6 lg:grid-cols-2">
@@ -127,15 +128,14 @@ function DetectTab() {
       </MotionCard>
 
       <MotionCard title="Results">
-        {/* Annotated frame — names are drawn by the backend */}
         <AnnotatedImage blob={annotated} filename="persons.jpg" />
 
         {result && (
           <div className="mt-4 space-y-3">
-            {/* Summary row */}
+            {/* ── Summary stats ───────────────────────────────── */}
             <div className="flex flex-wrap gap-3">
               <div className="flex flex-1 items-center justify-between rounded-lg border border-surface-border bg-muted/30 px-4 py-3">
-                <span className="text-sm text-muted-foreground">Detected</span>
+                <span className="text-sm text-muted-foreground">Bodies</span>
                 <motion.span
                   key={result.person_count}
                   initial={{ scale: 0.6, opacity: 0 }}
@@ -145,91 +145,90 @@ function DetectTab() {
                   {result.person_count}
                 </motion.span>
               </div>
-              {identified.length > 0 && (
+              {result.unbound_faces.length > 0 && (
+                <div className="flex flex-1 items-center justify-between rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+                  <span className="text-sm text-amber-400">Face only</span>
+                  <motion.span
+                    key={result.unbound_faces.length}
+                    initial={{ scale: 0.6, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    className="font-mono text-3xl font-bold text-amber-400"
+                  >
+                    {result.unbound_faces.length}
+                  </motion.span>
+                </div>
+              )}
+              {totalIdentified > 0 && (
                 <div className="flex flex-1 items-center justify-between rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-3">
                   <span className="text-sm text-green-400">Identified</span>
                   <motion.span
-                    key={identified.length}
+                    key={totalIdentified}
                     initial={{ scale: 0.6, opacity: 0 }}
                     animate={{ scale: 1, opacity: 1 }}
                     className="font-mono text-3xl font-bold text-green-400"
                   >
-                    {identified.length}
+                    {totalIdentified}
                   </motion.span>
                 </div>
               )}
             </div>
 
-            {/* Per-person table */}
-            {result.detections.length > 0 && (
+            {/* ── Unified results table ───────────────────────── */}
+            {(result.people.length > 0 || result.unbound_faces.length > 0) && (
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>track</TableHead>
-                    <TableHead>conf</TableHead>
+                    <TableHead>track / source</TableHead>
                     <TableHead>identity</TableHead>
                     <TableHead>sim</TableHead>
                     <TableHead>via</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {result.detections.map((d, i) => {
-                    const identity = idByTrack.get(d.track_id);
-                    return (
-                      <motion.tr
-                        key={`${d.track_id}-${i}`}
-                        custom={i}
-                        variants={rowMotion}
-                        initial="hidden"
-                        animate="show"
-                        className="border-b border-surface-border"
-                      >
-                        <TableCell className="font-mono">{d.track_id ?? "—"}</TableCell>
-                        <TableCell className="font-mono">
-                          {Math.round(d.confidence * 100)}%
-                        </TableCell>
-                        <TableCell>
-                          {identity ? (
-                            <span className="font-semibold text-green-400">
-                              {identity.name}
-                            </span>
-                          ) : (
-                            <span className="text-muted-foreground">Unknown</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="font-mono text-xs">
-                          {identity ? (
-                            <span
-                              className={
-                                identity.method === "face"
-                                  ? "text-green-400"
-                                  : "text-cyan-400"
-                              }
-                            >
-                              {(identity.similarity * 100).toFixed(1)}%
-                            </span>
-                          ) : (
-                            "—"
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {identity ? (
-                            <Badge
-                              className={`text-[10px] border-0 ${
-                                identity.method === "face"
-                                  ? "bg-green-500/20 text-green-400"
-                                  : "bg-cyan-500/20 text-cyan-400"
-                              }`}
-                            >
-                              {identity.method}
-                            </Badge>
-                          ) : (
-                            "—"
-                          )}
-                        </TableCell>
-                      </motion.tr>
-                    );
-                  })}
+                  {/* Body-detected persons */}
+                  {result.people.map((p, i) => (
+                    <motion.tr
+                      key={`body-${p.track_id}-${i}`}
+                      custom={i}
+                      variants={rowMotion}
+                      initial="hidden"
+                      animate="show"
+                      className="border-b border-surface-border"
+                    >
+                      <TableCell className="font-mono text-xs">
+                        {p.track_id !== null ? (
+                          <span className="rounded bg-muted/40 px-1.5 py-0.5">
+                            #{p.track_id}
+                          </span>
+                        ) : "—"}
+                      </TableCell>
+                      <TableCell>
+                        {p.name ? (
+                          <span className="font-semibold text-green-400">{p.name}</span>
+                        ) : (
+                          <span className="text-muted-foreground">Unknown</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {p.similarity !== null ? (
+                          <span className={p.method === "face" ? "text-green-400" : "text-cyan-400"}>
+                            {((p.similarity ?? 0) * 100).toFixed(1)}%
+                          </span>
+                        ) : "—"}
+                      </TableCell>
+                      <TableCell>
+                        {p.method ? (
+                          <Badge className={`text-[10px] border-0 ${
+                            p.method === "face"
+                              ? "bg-green-500/20 text-green-400"
+                              : "bg-cyan-500/20 text-cyan-400"
+                          }`}>
+                            {p.method}
+                          </Badge>
+                        ) : "—"}
+                      </TableCell>
+                    </motion.tr>
+                  ))}
                 </TableBody>
               </Table>
             )}
@@ -273,7 +272,11 @@ function AddPersonDialog({ onAdded }: { onAdded: () => void }) {
       const result = await addRegistryPerson(name.trim(), images);
       setOutcome(result);
       onAdded();
-      if (result.status === "ok") {
+      if (result.reused_existing_person) {
+        toast.success(
+          `Merged into existing "${result.name}" (${result.face_embeddings_added}F / ${result.body_embeddings_added}B embeddings added)`
+        );
+      } else if (result.face_embeddings_added > 0 || result.body_embeddings_added > 0) {
         toast.success(
           `Registered "${result.name}" (${result.face_embeddings_added}F / ${result.body_embeddings_added}B embeddings)`
         );

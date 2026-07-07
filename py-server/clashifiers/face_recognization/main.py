@@ -188,6 +188,7 @@ class FaceRecogniser:
         ctx_id     : int   = 0,           # -1 = CPU
     ):
         self.det_thresh = det_thresh
+        self._det_size  = det_size[0]   # store scalar for adaptive_detect restores
         self._load(ctx_id, det_size)
 
     def _load(self, ctx_id: int, det_size: tuple):
@@ -218,6 +219,50 @@ class FaceRecogniser:
                 landmarks  = [list(map(int, p)) for p in f.kps],
                 embedding  = f.embedding,
             ))
+        return results
+
+    def detect_and_embed(self, frame: np.ndarray) -> list[DetectedFace]:
+        """
+        Alias of detect() — returns all faces with ArcFace embeddings.
+        Called by pg_vector.add_person() and IdentityResolver so both paths
+        use the same entry-point without needing to import DetectedFace directly.
+        """
+        return self.detect(frame)
+
+    def adaptive_detect(
+        self,
+        frame: np.ndarray,
+        person_count_hint: int = 1,
+        sizes: tuple = (320, 640, 960),
+    ) -> list[DetectedFace]:
+        """
+        Retry face detection with progressively larger detection grids until
+        at least one face is found, or until all sizes have been tried.
+
+        Heuristic: choose the starting grid size based on crowd size —
+          1-2 people  → 320  (fast, close-up)
+          3-8 people  → 640  (balanced)
+          9+ people   → 960  (group/CCTV wide shot)
+
+        If the initial size finds nothing, upscale and retry.
+        """
+        # Pick starting index based on crowd size hint
+        if person_count_hint >= 9:
+            start_idx = 2
+        elif person_count_hint >= 3:
+            start_idx = 1
+        else:
+            start_idx = 0
+
+        for size in sizes[start_idx:]:
+            self.app.prepare(ctx_id=0, det_size=(size, size))
+            results = self.detect(frame)
+            if results:
+                break  # found faces — stop retrying
+
+        # Restore original det_size (re-use whatever was set at construction)
+        # Note: if ctx_id is unknown here, 0 works for both CPU and GPU paths
+        self.app.prepare(ctx_id=0, det_size=(self._det_size, self._det_size))
         return results
 
     def recognise(

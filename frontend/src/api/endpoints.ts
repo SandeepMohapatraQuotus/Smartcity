@@ -11,6 +11,7 @@ import type {
   ServerStatus,
   RegistryPerson,
   AddPersonOutcome,
+  IdentifyResult,
 } from "./types";
 
 
@@ -30,6 +31,18 @@ export const analyseFrame = (file: File) =>
   api.post<FrameEvent>("/analyse/frame", fileForm(file)).then((r) => r.data);
 
 export const analyseFrameAnnotated = (file: File): Promise<Blob> =>
+  api
+    .post("/analyse/frame/annotated", fileForm(file), { responseType: "blob" })
+    .then((r) => r.data);
+
+// ── Identity (new unified route: adaptive detection + spatial binding) ──
+export const analyseIdentify = (file: File) =>
+  api
+    .post("/analyse/identify", fileForm(file))
+    .then((r) => r.data as IdentifyResult);
+
+export const analyseIdentifyAnnotated = (file: File): Promise<Blob> =>
+  // /analyse/frame/annotated still draws correct face boxes (pipeline.annotate)
   api
     .post("/analyse/frame/annotated", fileForm(file), { responseType: "blob" })
     .then((r) => r.data);
@@ -80,7 +93,7 @@ export const stopStream = () => api.post("/stream/stop").then((r) => r.data);
 export const getStreamStatus = () =>
   api.get<StreamStatus>("/stream/status").then((r) => r.data);
 
-// ── Watchlist ─────────────────────────────────────────────────────
+// ── Watchlist / Person Registry ──────────────────────────────────
 export const addToWatchlist = (person_id: string, name: string, photo: File) =>
   api
     .post("/watchlist/add", fileForm(photo, { person_id, name }))
@@ -102,16 +115,18 @@ export const getAlerts = (limit = 100) =>
 export const clearBuffers = () => api.delete("/events").then((r) => r.data);
 
 // ── Person Registry ───────────────────────────────────────────────
+// All three routes map to /watchlist/* — the backend now serves the
+// pgvector registry through those endpoints (Watchlist was removed).
 export const addRegistryPerson = (name: string, images: File[]) => {
   const fd = new FormData();
   fd.append("name", name);
-  for (const img of images) fd.append("images", img);
-  return api.post<AddPersonOutcome>("/person/add", fd).then((r) => r.data);
+  // Field MUST be 'files' to match the FastAPI route: files: List[UploadFile]
+  for (const img of images) fd.append("files", img);
+  return api.post<AddPersonOutcome>("/watchlist/add", fd).then((r) => r.data);
 };
 
 export const removeRegistryPerson = (person_id: string) =>
-  api.delete(`/person/${person_id}`).then((r) => r.data);
+  api.delete(`/watchlist/${person_id}`).then((r) => r.data);
 
 export const listRegistryPeople = () =>
-  api.get<{ people: RegistryPerson[] }>("/person").then((r) => r.data.people);
-
+  api.get<{ total: number; people: RegistryPerson[] }>("/watchlist").then((r) => r.data.people);
