@@ -11,7 +11,6 @@ Swagger UI (auto-generated):
 """
 import uvicorn
 import asyncio
-import base64
 import io
 import time
 from collections import deque
@@ -19,7 +18,6 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import UploadFile, File, Form
 from typing import List
-import traceback
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
@@ -50,6 +48,10 @@ stream_state = {
     "frame_count": 0,
     "error":       None,
 }
+
+# Latest annotated JPEG bytes — written by _stream_worker, read by /stream/mjpeg
+# Python's GIL makes a single bytes assignment atomic, so no explicit lock needed.
+_latest_annotated_frame: Optional[bytes] = None
 
 _start_time = time.time()
 
@@ -106,12 +108,6 @@ app.add_middleware(
 )
 
 
-# ─── Pydantic Schemas ─────────────────────────────────────────────────────────
-
-class Base64Request(BaseModel):
-    image_b64 : str
-    camera_id : str            = "cam_01"
-    frame_id  : Optional[str] = None
 
 class StreamStartRequest(BaseModel):
     source    : str            # RTSP URL or file path
@@ -153,12 +149,6 @@ def _decode_bytes(raw: bytes) -> np.ndarray:
             ),
         )
 
-def _decode_b64(b64: str) -> np.ndarray:
-    try:
-        return _decode_bytes(base64.b64decode(b64))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 image data.")
-
 def _serialise(event: FrameEvent) -> dict:
     """Convert FrameEvent → JSON-safe dict.
     faces is now a list of plain dicts (no nested numpy embeddings) so no
@@ -177,13 +167,7 @@ def _store(event: FrameEvent):
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 
-@app.get("/", tags=["Health"])
-async def root():
-    return {
-        "service": "Smart City Video Analytics API",
-        "docs":    "/docs",
-        "status":  "ok",
-    }
+
 
 
 @app.get("/status", tags=["Health"])
@@ -223,19 +207,7 @@ async def analyse_frame(
 
 
 
-@app.post("/analyse/base64", tags=["Analysis"])
-async def analyse_base64(body: Base64Request):
-    """
-    Send a base64-encoded image (browser canvas, IoT device, mobile).
-    Same response shape as /analyse/frame.
-    """
-    frame = _decode_b64(body.image_b64)
-    pipeline.camera_id = body.camera_id
-    event = pipeline.process_frame(frame)
-    if body.frame_id:
-        event.frame_id = body.frame_id
-    _store(event)
-    return JSONResponse(content=_serialise(event))
+
 
 
 @app.post("/analyse/frame/annotated", tags=["Analysis"])
@@ -477,172 +449,10 @@ async def dehaze_frame_compare(
         },
     )
 
-@app.post("/person/add")
-async def add_person(name: str = Form(...), images: List[UploadFile] = File(...)):
-    """
-    Register a person by name using one or more reference images.
-    Images can be clear face photos, full-body/CCTV shots, or a mix.
-    For each image: a face embedding is stored if a face is found,
-    and a body Re-ID embedding is stored if a person is detected.
-    An image only counts as 'skipped' if neither succeeds.
-    """
-    decoded_images = []
-    for upload in images:
-        raw = await upload.read()
-        frame = _decode_bytes(raw)
-        if frame is not None:
-            decoded_images.append(frame)
- 
-    if not decoded_images:
-        return {"error": "No valid images could be decoded."}
- 
-    outcome = pipeline.person_registry.add_person(
-        name=name,
-        images=decoded_images,
-        face_recogniser=pipeline.recogniser,
-        person_detector=pipeline.person_detector,
-        reidentifier=pipeline.reidentifier,
-    )
-
-    if outcome.registry_unavailable:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Person registry is unavailable: pgvector extension is not installed "
-                "on the PostgreSQL server. "
-                "Run: sudo apt install postgresql-17-pgvector "
-                "then re-run pgvector_setup.sql and restart the server."
-            ),
-        )
-
-    status = "ok" if (outcome.face_embeddings_added or outcome.body_embeddings_added) else "warning_no_usable_images"
-    return {
-        "person_id": outcome.person_id,
-        "name": outcome.name,
-        "images_received": outcome.images_received,
-        "face_embeddings_added": outcome.face_embeddings_added,
-        "body_embeddings_added": outcome.body_embeddings_added,
-        "images_skipped": outcome.images_skipped,
-        "status": status,
-        "errors": outcome.errors if status != "ok" else [],
-    }
- 
- 
-@app.delete("/person/{person_id}")
-async def remove_person(person_id: str):
-    removed = pipeline.person_registry.remove(person_id)
-    if not removed:
-        return {"error": f"No person found with id {person_id}"}
-    return {"status": "removed", "person_id": person_id}
- 
- 
-@app.get("/person")
-async def list_people():
-    return {"people": pipeline.person_registry.list_people()}
-
-
-# =====================================================================
-# CORRECTED DEBUG ROUTE — uses pipeline.recogniser.recognise(...) and
-# pipeline.watchlist, matching the real pipeline.py attribute names.
-# =====================================================================
-@app.get("/person/debug_status")
-async def debug_registry_status():
-    """
-    Reports whether PersonRegistry actually has a live DB connection right
-    now. If '_available' is False, every match silently returns null/0.0
-    with no visible error — this endpoint exposes that hidden state.
-    """
-    reg = pipeline.person_registry
-    print(f"DEBUG debug_status: id(reg)={id(reg)}, id(reg._conn)={id(reg._conn)}")
-    status = {"available": reg._available}
-    if reg._available:
-        try:
-            with reg._conn.cursor() as cur:
-                cur.execute("SELECT count(*) FROM persons")
-                status["persons_count"] = cur.fetchone()[0]
-                cur.execute("SELECT count(*) FROM face_embeddings")
-                status["face_embeddings_count"] = cur.fetchone()[0]
-                cur.execute("SELECT count(*) FROM body_embeddings")
-                status["body_embeddings_count"] = cur.fetchone()[0]
-                cur.execute("SELECT current_database()")
-                status["connected_database"] = cur.fetchone()[0]
-        except Exception as e:
-            status["query_error"] = str(e)
-    else:
-        status["reason"] = "Connection failed at startup — check server console logs for the PersonRegistry warning printed when SmartCityPipeline() was constructed."
-    return status
-@app.post("/person/debug_match_all")
-async def debug_match_all_faces(image: UploadFile = File(...)):
-    """
-    Upload a test image (can contain multiple people). Only returns faces
-    and bodies where a registered person was actually matched (i.e. passed
-    the similarity threshold). Non-matches are silently dropped — bbox is
-    only included when there's a real match.
-    """
-    raw = await image.read()
-    frame = _decode_bytes(raw)
-    if frame is None:
-        return {"error": "Could not decode image."}
-
-    output = {"faces": [], "bodies": []}
-
-    # --- Check every face in the image ---
-    try:
-        detected_faces = pipeline.recogniser.detect(frame)
-        for i, face in enumerate(detected_faces or []):
-            if face.embedding is None:
-                continue
-
-            raw_person, raw_sim = pipeline.person_registry._match(
-                "face_embeddings",
-                face.embedding,
-                threshold=pipeline.person_registry.face_sim_threshold,
-            )
-
-            if raw_person is not None:
-                output["faces"].append({
-                    "face_index": i,
-                    "bbox": list(face.bbox),
-                    "detection_confidence": float(face.confidence),
-                    "best_match": raw_person,
-                    "similarity": raw_sim,
-                })
-    except Exception as e:
-        output["face_error"] = str(e)
-        output["face_error_type"] = type(e).__name__
-        output["face_error_trace"] = traceback.format_exc()
-
-    # --- Check every detected person's body ---
-    try:
-        det_result = pipeline.person_detector.detect(frame, frame_id="debug", camera_id="debug")
-        for i, det in enumerate(getattr(det_result, "detections", [])):
-            x1, y1, x2, y2 = det.bbox
-            crop = frame[int(y1):int(y2), int(x1):int(x2)]
-            vec = pipeline.reidentifier.embed(crop)
-            if vec is None:
-                continue
-
-            raw_person, raw_sim = pipeline.person_registry._match(
-                "body_embeddings",
-                vec,
-                threshold=pipeline.person_registry.body_sim_threshold,
-            )
-
-            # Only keep this body if it actually passed the threshold
-            if raw_person is not None:
-                output["bodies"].append({
-                    "person_index": i,
-                    "bbox": list(det.bbox),
-                    "best_match": raw_person,
-                    "similarity": raw_sim,
-                })
-    except Exception as e:
-        output["body_error"] = str(e)
-        output["body_error_type"] = type(e).__name__
-        output["body_error_trace"] = traceback.format_exc()
-
-    return output# ─── Stream ───────────────────────────────────────────────────────────────────
+# ─── Stream ───────────────────────────────────────────────────────────────────
 async def _stream_worker(source: str, camera_id: str):
+    global _latest_annotated_frame
+
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         stream_state["running"] = False
@@ -659,7 +469,11 @@ async def _stream_worker(source: str, camera_id: str):
         while stream_state["running"]:
             ret, frame = cap.read()
             if not ret:
-                break
+                # For video files: loop back to the beginning instead of stopping
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
             frame_idx += 1
             if frame_idx % PROCESS_EVERY_N != 0:
@@ -671,10 +485,19 @@ async def _stream_worker(source: str, camera_id: str):
             )
             _store(event)
             stream_state["frame_count"] += 1
-            await asyncio.sleep(0)
+
+            # ── Cache latest annotated JPEG for /stream/mjpeg ─────────────
+            annotated = await asyncio.get_event_loop().run_in_executor(
+                None, pipeline.annotate, frame, event
+            )
+            _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _latest_annotated_frame = buf.tobytes()
+
+            await asyncio.sleep(0)  # yield to event loop
     finally:
         cap.release()
         stream_state["running"] = False
+        _latest_annotated_frame = None
         print(f"[Stream] Stopped — {stream_state['frame_count']} frames processed.")
 
 @app.post("/stream/start", tags=["Stream"])
@@ -716,179 +539,70 @@ async def stream_status():
     }
 
 
-# ─── MJPEG Live Stream ────────────────────────────────────────────────────────
-
-def _draw_all(frame: np.ndarray, event: "FrameEvent") -> np.ndarray:
+async def _mjpeg_generator():
     """
-    Draws all classifier results onto the frame and returns the annotated copy.
+    Async generator that yields multipart MJPEG frames.
+    Reads from _latest_annotated_frame every ~33 ms (~30 fps cap).
+    Sends a placeholder frame when the stream is not yet running.
     """
-    annotated = frame.copy()
-    if event.vehicles:
-        annotated = pipeline.vehicles.draw(annotated, event.vehicles)
-    if event.persons:
-        annotated = pipeline.person_detector.draw(annotated, event.persons)
-
-    # ── Overlay identified person names ──────────────────────────────
-    if event.identified_people and event.persons:
-        id_by_track = {p["track_id"]: p for p in event.identified_people}
-        for det in event.persons.detections:
-            identity = id_by_track.get(det.track_id)
-            if not identity:
-                continue
-            x1, y1 = det.bbox[0], det.bbox[1]
-            method  = identity.get("method", "")
-            name    = identity["name"]
-            sim     = identity["similarity"]
-            label   = f"{name}  {sim:.2f}  [{method}]"
-            # green for face match, cyan for body match
-            color = (0, 230, 80) if method == "face" else (0, 220, 255)
-            # dark backing bar so text is readable on any background
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-            cv2.rectangle(annotated, (x1, y1 - th - 14), (x1 + tw + 8, y1 - 2), (20, 20, 20), -1)
-            cv2.putText(annotated, label, (x1 + 4, y1 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-    # ── Face boxes (now plain dicts, not FaceResult objects) ─────────
-    for f in event.faces:
-        x1, y1, x2, y2 = f["bbox"]
-        is_alert = f["best_match"] is not None
-        color = (0, 0, 255) if is_alert else (0, 255, 0)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        label = (f"{f['best_match']['name']} ({f['similarity']:.2f})"
-                 if is_alert else f"Unknown ({f['confidence']:.2f})")
-        cv2.putText(annotated, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-    return annotated
-
-
-
-def _open_capture(source: str) -> cv2.VideoCapture:
-    """
-    Opens a VideoCapture and raises a clean 400 if it fails.
-    """
-    target = int(source) if source.isdigit() else source
-    cap = cv2.VideoCapture(target)
-
-    if not cap.isOpened():
-        cap.release()
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Cannot open source {source!r}. "
-                "No webcam found (device index out of range), "
-                "RTSP unreachable, or file path invalid. "
-                "Try: an RTSP URL, a local video file path, or GET /stream/sources."
-            ),
-        )
-    return cap
-
-
-async def _mjpeg_generator(cap: cv2.VideoCapture, jpeg_quality: int = 75):
-    """Yields MJPEG frames. cap is already validated open."""
-    try:
-        while True:
-            ret, frame = cap.read()
-
-            if not ret:
-                await asyncio.sleep(0.05)
-                continue
-
-            event = await asyncio.to_thread(pipeline.process_frame, frame)
-            _store(event)
-
-            annotated = _draw_all(frame, event)
-            dn_label  = f"{event.day_night['label'].upper()}  {event.day_night['confidence']:.2f}"
-            if event.enhanced:
-                dn_label += "  [ENHANCED]"
+    boundary = b"--frame"
+    while True:
+        frame_bytes = _latest_annotated_frame
+        if frame_bytes is None:
+            # Send a small black placeholder so the <img> doesn't error out
+            placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(
-                annotated, dn_label, (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2,
+                placeholder, "Waiting for stream...",
+                (120, 190), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2,
             )
+            _, buf = cv2.imencode(".jpg", placeholder)
+            frame_bytes = buf.tobytes()
 
-            ok, buf = cv2.imencode(
-                ".jpg", annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
-            )
-            if not ok:
-                continue
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + buf.tobytes()
-                + b"\r\n"
-            )
-            await asyncio.sleep(0)
-
-    finally:
-        cap.release()
-
-
-@app.get(
-    "/stream/mjpeg",
-    tags=["Stream"],
-    summary="Live MJPEG stream",
-    description=(
-        "Returns a multipart/x-mixed-replace stream. "
-        "Paste the URL directly into a browser tab or an <img> src attribute. "
-        "Pass ?source= to override the stream URL (default: webcam 0). "
-        "Pass ?quality= (1-95) to trade bandwidth for image quality."
-    ),
-)
-async def stream_mjpeg(source: str = None, quality: int = 75):
-    """
-    GET /stream/mjpeg
-    """
-    resolved = source or stream_state.get("source")
-    if not resolved:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No source specified and no stream is currently running. "
-                "Either pass ?source= or POST /stream/start first."
-            ),
+        yield (
+            boundary + b"\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n"
+            b"\r\n" + frame_bytes + b"\r\n"
         )
+        await asyncio.sleep(0.033)  # ~30 fps
 
-    cap = _open_capture(resolved)
 
+@app.get("/stream/mjpeg", tags=["Stream"])
+async def stream_mjpeg(source: Optional[str] = None):
+    """
+    MJPEG HTTP stream — consumed by the MjpegPlayer <img> tag.
+    Returns a continuous multipart/x-mixed-replace stream of annotated JPEG frames.
+    The `source` query parameter is accepted but ignored here; the active
+    stream source is set via POST /stream/start.
+    """
     return StreamingResponse(
-        _mjpeg_generator(cap, jpeg_quality=quality),
+        _mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma":        "no-cache",
-            "Expires":       "0",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 
 
-@app.get("/stream/sources", tags=["Stream"], summary="List available camera devices")
-def stream_sources():
+@app.get("/stream/frame", tags=["Stream"])
+async def stream_single_frame():
     """
-    Probes device indices 0-9 and returns which ones OpenCV can open.
+    Return the **latest single annotated JPEG** frame.
+    Useful for a polling-based display or debugging.
     """
-    found = []
-    for i in range(10):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            found.append({
-                "index":  i,
-                "source": str(i),
-                "width":  int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                "fps":    cap.get(cv2.CAP_PROP_FPS),
-            })
-            cap.release()
+    frame_bytes = _latest_annotated_frame
+    if frame_bytes is None:
+        raise HTTPException(status_code=503, detail="No active stream. POST /stream/start first.")
+    return StreamingResponse(
+        io.BytesIO(frame_bytes),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache"},
+    )
 
-    return {
-        "cameras_found": len(found),
-        "devices":       found,
-        "hint": (
-            "No cameras found - use an RTSP URL or a local video file path instead."
-            if not found else
-            "Pass ?source=<index> to /stream/mjpeg"
-        ),
-    }
+
+
 
 
 
