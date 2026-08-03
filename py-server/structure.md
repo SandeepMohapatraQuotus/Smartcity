@@ -1,24 +1,27 @@
 # Smart City Platform — py-server Documentation
 
-> **Last updated:** 2026-07-03 | **Server:** FastAPI + Uvicorn | **Python:** 3.10+
+> **Last updated:** 2026-07-20 | **Server:** FastAPI + Uvicorn | **Python:** 3.12
 
 ---
 
-## 1. What This Project Does
+## 1. What This Server Does
 
-The `py-server` is the **AI/ML backend** of the Smart City Platform. It accepts images or video streams from cameras deployed across a city and runs multiple computer-vision pipelines on each frame — returning structured JSON results or annotated images.
+The py-server is the AI/ML backend of the Smart City Platform. It processes images and video streams from cameras, running multiple computer-vision pipelines per frame and returning structured JSON or annotated images over REST and WebSocket.
 
-### Core Use Cases
+### Core Capabilities
 
-| Use Case | How It Works |
-|----------|-------------|
-| **Traffic monitoring** | YOLOv8 detects and tracks cars, trucks, buses, motorcycles with unique IDs |
-| **Person crowd monitoring** | YOLOv8 detects and counts people in a scene |
-| **Night-time surveillance** | Auto-detects dark frames and enhances them through a chained pipeline (Gamma Correction → CLAHE → Zero-DCE++) before detection |
-| **Vehicle number plate reading** | ANPR pipeline localises plates + EasyOCR reads the text |
-| **Face watchlist alerts** | Detects faces, generates ArcFace embeddings, matches against a watchlist of persons of interest |
-| **Haze/fog removal** | Dark Channel Prior + MSRCR converts foggy frames to clear images |
-| **Live RTSP stream processing** | Continuously processes a camera stream as a background task |
+| Capability | Models Used |
+|---|---|
+| Day/Night classification | MobileNetV2 (ImageNet pretrained) |
+| Night image enhancement | Gamma Correction → CLAHE → Zero-DCE++ (chained) |
+| Vehicle detection + tracking | YOLOv8m + BotSORT |
+| Person detection + tracking | YOLOv8m + BotSORT |
+| Face detection + recognition | RetinaFace + ArcFace (InsightFace buffalo_l) |
+| Person identity matching | pgvector (face embeddings + body Re-ID) |
+| Number plate reading (ANPR) | YOLOv11n (plate detector) + EasyOCR |
+| Haze/fog removal | Dark Channel Prior + MSRCR |
+| Live stream processing | RTSP/file via OpenCV background worker |
+| Real-time WebSocket push | ws://localhost:8000/ws |
 
 ---
 
@@ -26,520 +29,448 @@ The `py-server` is the **AI/ML backend** of the Smart City Platform. It accepts 
 
 ```
 py-server/
-├── main.py                              ← FastAPI server — all REST endpoints
-├── pipeline.py                          ← Orchestrator — ties every service together
+├── main.py                              ← FastAPI app — all REST + WebSocket endpoints
+├── pipeline.py                          ← SmartCityPipeline — orchestrates all models per frame
+├── pg_vector.py                         ← PersonRegistry — pgvector-backed face+body identity store
+├── pgvector_setup.sql                   ← SQL to create persons/face_embeddings/body_embeddings tables
 ├── requirements.txt                     ← pip dependencies
-├── yolov8m.pt                           ← YOLOv8m pretrained weights (COCO)
+├── yolov8m.pt                           ← YOLOv8m weights (COCO, shared by vehicle+person detectors)
+├── yolov8n.pt                           ← YOLOv8n weights (lighter variant)
 ├── structure.md                         ← This documentation file
-├── .venv/                               ← Python virtual environment (gitignored)
+├── run.txt                              ← Quick-start run commands
+├── .env                                 ← Environment variables (DB DSN etc.)
+├── .venv/                               ← Python virtual environment
+├── weights/
+│   └── license_plate_yolov8n.pt         ← Fine-tuned plate detector (YOLOv11n)
 │
-├── clashifiers/                         ← Individual classifier modules
+├── clashifiers/                         ← All classifier/detector modules
+│   ├── __init__.py
+│   ├── identity_resolver.py             ← IdentityResolver — unified face+body identity per frame
 │   ├── day_night/
-│   │   ├── __init__.py
-│   │   └── main.py                      ← Day/Night Classifier (MobileNetV2)
-│   ├── vechile_detector/
-│   │   ├── __init__.py
-│   │   └── main.py                      ← Vehicle Detector (YOLOv8m + ByteTrack)
+│   │   └── main.py                      ← DayNightClassifier (MobileNetV2, two-stage heuristic+CNN)
 │   ├── face_recognization/
-│   │   ├── __init__.py
-│   │   └── main.py                      ← Face Recogniser (RetinaFace + ArcFace)
-│   └── person_detector/
-│       ├── __init__.py
-│       └── main.py                      ← Person Detector (YOLOv8m COCO class 0)
+│   │   └── main.py                      ← FaceRecogniser (RetinaFace+ArcFace), Watchlist, CLAHE preprocess
+│   ├── person_detector/
+│   │   └── main.py                      ← PersonDetector (YOLOv8m, BotSORT, adaptive_detect)
+│   ├── person_reid/
+│   │   └── main.py                      ← PersonReIdentifier (OSNet, body embedding extraction)
+│   ├── person_registry/
+│   │   └── main.py                      ← (legacy stub, replaced by pg_vector.PersonRegistry)
+│   └── vechile_detector/
+│       └── main.py                      ← VehicleDetector (YOLOv8m, BotSORT tracking)
 │
 ├── services/
 │   ├── __init__.py
-│   ├── classical_enhance.py             ← Gamma Correction + CLAHE (model-free enhancement)
-│   ├── zero_dce.py                      ← Night enhancer — chains Gamma → CLAHE → Zero-DCE++
-│   ├── anpr.py                          ← Number plate recognition (EasyOCR)
-│   └── dehazing.py                      ← Haze/fog removal (DCP + MSRCR)
+│   ├── classical_enhance.py             ← Gamma Correction + CLAHE (CPU-only, model-free)
+│   ├── zero_dce.py                      ← ZeroDCEEnhancer — chains Gamma→CLAHE→Zero-DCE++
+│   ├── anpr.py                          ← ANPRService — plate localisation + EasyOCR
+│   └── dehazing.py                      ← DehazingService — DCP + MSRCR
 │
-└── Zero-DCE_extension/                  ← Cloned Zero-DCE++ repo (pretrained weights)
+└── Zero-DCE_extension/
     └── Zero-DCE++/
-        ├── model.py                     ← Network architecture
-        ├── Myloss.py                    ← Custom loss functions
-        ├── dataloader.py                ← Dataset loader
-        ├── lowlight_train.py            ← Training script
+        ├── model.py                     ← enhance_net_nopool CNN architecture
+        ├── Myloss.py                    ← L_color, L_spa, L_exp, L_TV loss functions
+        ├── dataloader.py                ← lowlight_loader PyTorch dataset
+        ├── lowlight_train.py            ← Training script (CUDA, 100 epochs)
         ├── lowlight_test.py             ← Inference script
         └── snapshots_Zero_DCE++/
-            └── Epoch99.pth              ← Pretrained weights (99 epochs)
+            └── Epoch99.pth              ← Pretrained weights used by ZeroDCEEnhancer
 ```
 
 ---
 
-## 3. All REST API Routes
+## 3. API Routes
 
-**Base URL:** `http://localhost:8000`  
-**Swagger UI:** `http://localhost:8000/docs`
+**Base URL:** http://localhost:8000  |  **Swagger:** http://localhost:8000/docs  |  **WebSocket:** ws://localhost:8000/ws
 
 ### Health
 
 | Method | Route | Description |
-|--------|-------|-------------|
-| `GET` | `/` | Health check — returns `{ service, docs, status }` |
-| `GET` | `/status` | Pipeline ready state + uptime + model names |
+|---|---|---|
+| GET | /status | Pipeline ready state, uptime, model names |
 
-### Analysis (Full Pipeline)
+### Analysis — Full Pipeline
 
-| Method | Route | Input | Output |
-|--------|-------|-------|--------|
-| `POST` | `/analyse/frame` | Image upload | JSON — all classifiers (day/night + vehicles + persons + plates + faces + alerts) |
-| `POST` | `/analyse/base64` | Base64 JSON body | Same as above |
-| `POST` | `/analyse/frame/annotated` | Image upload | Annotated JPEG with all bounding boxes drawn |
+| Method | Route | Description |
+|---|---|---|
+| POST | /analyse/frame | Upload image → run ALL classifiers → return JSON FrameEvent |
+| POST | /analyse/frame/annotated | Upload image → return annotated JPEG with all boxes drawn |
+| POST | /analyse/identify | Upload image → run IdentityResolver → per-person identity JSON |
 
-### Classifiers (Individual)
+### Individual Classifiers
 
-| Method | Route | Input | Output |
-|--------|-------|-------|--------|
-| `POST` | `/classify/day-night` | Image upload | `{ label, confidence, route_to_enhancement, method }` |
-| `POST` | `/enhance/frame` | Image upload | Enhanced JPEG — chained Gamma → CLAHE → Zero-DCE++ |
-| `POST` | `/detect/vehicles` | Image upload | JSON — vehicle list with bbox, label, confidence, track_id |
-| `POST` | `/detect/persons` | Image upload | JSON — person list with bbox, confidence, track_id, center, area |
+| Method | Route | Description |
+|---|---|---|
+| POST | /classify/day-night | Day/Night label + confidence + enhancement flag |
+| POST | /enhance/frame | Gamma→CLAHE→Zero-DCE++ enhanced JPEG |
+| POST | /detect/vehicles | YOLOv8 vehicle detections + track IDs |
+| POST | /detect/persons | YOLOv8 person detections + track IDs |
 
-### ANPR (Number Plate Recognition)
+### ANPR
 
-| Method | Route | Input | Output |
-|--------|-------|-------|--------|
-| `POST` | `/anpr/read` | Image upload | JSON — plates with bbox, raw_text, cleaned_text, confidence |
-| `POST` | `/anpr/read/annotated` | Image upload | Annotated JPEG with plate text drawn on image |
+| Method | Route | Description |
+|---|---|---|
+| POST | /anpr/read | Plate detection + OCR → JSON |
+| POST | /anpr/read/annotated | Plate detection + OCR → annotated JPEG |
 
 ### Dehazing
 
-| Method | Route | Input | Output |
-|--------|-------|-------|--------|
-| `POST` | `/dehaze/frame` | Image upload + `strength` (0.5–1.0) | Dehazed JPEG — auto selects DCP or MSRCR |
-| `POST` | `/dehaze/frame/compare` | Image upload | Side-by-side comparison JPEG (original vs dehazed) |
+| Method | Route | Description |
+|---|---|---|
+| POST | /dehaze/frame | Dehazed JPEG (strength param 0.5–1.0) |
+| POST | /dehaze/frame/compare | Side-by-side comparison JPEG |
 
-### Stream (RTSP / Live Camera)
+### Stream (RTSP / File)
 
 | Method | Route | Description |
-|--------|-------|-------------|
-| `POST` | `/stream/start` | Start processing an RTSP stream as a background task |
-| `POST` | `/stream/stop` | Signal the stream to stop |
-| `GET` | `/stream/status` | Returns `{ running, source, camera_id, frames_processed, error }` |
+|---|---|---|
+| POST | /stream/start | Start background stream worker (body: source, camera_id) |
+| POST | /stream/stop | Stop the running stream |
+| GET | /stream/status | running, source, camera_id, frames_processed, error |
+| GET | /stream/mjpeg | MJPEG HTTP stream — consumed by img tag (~30fps) |
+| GET | /stream/frame | Latest single annotated JPEG (for polling) |
 
-### Watchlist (Face Alerts)
+### Watchlist / Person Registry
 
 | Method | Route | Description |
-|--------|-------|-------------|
-| `POST` | `/watchlist/add` | Upload reference photo → extract ArcFace embedding → store |
-| `DELETE` | `/watchlist/{person_id}` | Remove person from watchlist |
-| `GET` | `/watchlist` | List all persons on the watchlist |
+|---|---|---|
+| POST | /watchlist/add | Upload reference photo(s) → extract face+body embeddings → store in pgvector |
+| DELETE | /watchlist/{person_id} | Remove person from registry |
+| GET | /watchlist | List all registered persons with face+body ref counts |
 
 ### Events & Alerts
 
 | Method | Route | Description |
-|--------|-------|-------------|
-| `GET` | `/events?limit=50` | Last N frame events from in-memory ring buffer |
-| `GET` | `/alerts?limit=100` | All face-watchlist hit alerts |
-| `DELETE` | `/events` | Clear both event and alert buffers |
+|---|---|---|
+| GET | /events?limit=50 | Last N FrameEvents from ring buffer |
+| GET | /alerts?limit=100 | All face/person registry hit alerts |
+| DELETE | /events | Clear both buffers |
+
+### WebSocket
+
+| Endpoint | Description |
+|---|---|
+| ws://localhost:8000/ws | Persistent connection — server pushes snapshot on every processed frame + every 500ms heartbeat |
+
+WebSocket payload shape:
+```json
+{
+  stream_status: { running: true, source: ..., camera_id: cam_01, frames_processed: 42, error: null },
+  latest_event:  { ...full FrameEvent dict... },
+  alerts:        [ ...all accumulated alerts... ]
+}
+```
 
 ---
 
-## 4. File-by-File Reference
+## 4. Pipeline Flow (process_frame)
 
----
-
-### `main.py` — FastAPI Server
-
-**Role:** Entry point for all HTTP requests. Loads the pipeline once at startup, routes requests to the correct service, serialises results.
-
-**Key internals:**
-- `lifespan()` — FastAPI lifespan handler that constructs `SmartCityPipeline` at startup (including the enhancement-chain knobs) and cleans up streams on shutdown
-- `event_buffer` — `deque(maxlen=500)` storing the last 500 frame JSON results
-- `alert_buffer` — `deque(maxlen=200)` storing face watchlist hit alerts
-- `_decode_bytes(raw)` — decodes raw file upload bytes into a BGR numpy array
-- `_decode_b64(b64)` — decodes base64 string into a BGR numpy array
-- `_serialise(event)` — converts `FrameEvent` to JSON-safe dict, stripping numpy embeddings
-- `_store(event)` — appends event + alerts to both ring buffers
-- CORS middleware enabled for all origins (development mode)
-
-`POST /enhance/frame` returns the enhanced JPEG plus diagnostic headers:
-`X-Enhancement-Method` (e.g. `gamma[1.62]+clahe+zero_dce`), `X-Stages-Applied` (comma list of stages that actually ran), `X-Gamma-Used` (the adaptive gamma value picked for that frame).
-
----
-
-### `pipeline.py` — Pipeline Orchestrator
-
-**Role:** Instantiated once at startup. Owns every model. `process_frame()` is the single call that runs the entire AI pipeline on one BGR frame.
-
-**Pipeline flow per frame:**
+Every frame goes through these stages in order inside SmartCityPipeline.process_frame():
 
 ```
 BGR Frame
-    │
-    ▼
+  │
+  ▼
 [1] DayNightClassifier.predict()
-    │
-    ├── night? ──▶ [2] ZeroDCEEnhancer.enhance()
-    │                    Gamma Correction → CLAHE → Zero-DCE++ (chained)
-    │                         │
-    └─────────────────────────┘
-                  │
-    ┌─────────────┼─────────────┬─────────────────┐
-    ▼             ▼             ▼                 ▼
-[3] VehicleDetector  [4] PersonDetector  [5] ANPRService  [6] FaceRecogniser
-    .detect()            .detect()           .read_plates()    .recognise()
-    │                    │                   │                 │
-    └─────────────────────────────────────────┘─────────────────┘
-                              ▼
-                [7] Alert collection (face watchlist hits)
-                              ▼
-                         FrameEvent
-                    (returned to API / stored in ring buffer)
+    BRIGHT_THRESH=160 → day (skip enhancement)
+    DARK_THRESH=85    → night → enhancement
+    61-159 brightness → MobileNetV2 CNN decides
+  │
+  ├── if night ──▶ [2] ZeroDCEEnhancer.enhance()
+  │                     Gamma Correction (adaptive, target mean=128)
+  │                     → CLAHE (clip=3.0, tile=8x8, LAB L-channel)
+  │                     → Zero-DCE++ (CNN, Epoch99.pth)
+  │
+  ▼ (working frame = enhanced or original)
+  │
+  ├──[parallel]──▶ [3] VehicleDetector.detect()   ← runs in thread pool
+  │
+  ├──[sync]──────▶ [4] PersonDetector.adaptive_detect()
+  │                     0-3 people  → native resolution
+  │                     4-8 people  → upscale to 1280px wide
+  │                     9+ people   → upscale to 1920px wide
+  │                     min_height filter=40px (kills false positives)
+  │                     BotSORT tracker (replaces ByteTrack)
+  │                     conf=0.30, iou=0.50
+  │
+  ├──[sync]──────▶ [5] FaceRecogniser.adaptive_detect()
+  │                     _preprocess_for_face_detection() ← CLAHE always-on
+  │                     det_thresh=0.35 (was 0.5)
+  │                     320px grid for 1-2 people
+  │                     640px grid for 3-8 people
+  │                     960px grid for 9+ people (retry up if no faces found)
+  │                     ArcFace 512-d embedding per face
+  │
+  ├──[wait]──────▶ [6] VehicleDetector result collected
+  │
+  ├──────────────▶ [7] Face identity matching via PersonRegistry.match_face()
+  │                     pgvector cosine similarity search
+  │                     face_sim_threshold=0.70
+  │                     → face_watchlist_hit alert if matched
+  │
+  ├──────────────▶ [8] Per-person body+face binding + identity
+  │                     For each detected person body:
+  │                       - Find face whose centre is inside body bbox
+  │                       - If face found → use face embedding for identity
+  │                       - If no face → run OSNet body Re-ID embedding
+  │                     PersonRegistry.identify() → face-first, body fallback
+  │                     body_sim_threshold=0.82, margin_check=0.06
+  │                     → person_registry_hit alert if matched
+  │
+  └──────────────▶ [9] ANPRService.read_plates_in_vehicles()
+                        (runs every anpr_interval frames, default=1)
+                        Stage 1: YOLOv11n plate detector (or contour fallback)
+                        Stage 2: EasyOCR (or pytesseract fallback)
+                        Restricted to vehicle bboxes only
+
+  ▼
+FrameEvent (stored in event_buffer, broadcast to all WebSocket clients)
+  ▼
+pipeline.annotate() → JPEG → _latest_annotated_frame → /stream/mjpeg
 ```
 
-**`FrameEvent` dataclass fields:**
+---
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `frame_id` | `str` | Auto-generated (e.g. `frame_000042`) |
-| `camera_id` | `str` | Which camera this frame is from |
-| `timestamp` | `float` | Unix timestamp |
-| `day_night` | `dict` | `{ label, confidence, route_to_enhancement, method }` |
-| `enhanced` | `bool` | Whether night enhancement was applied |
-| `vehicles` | `VehicleDetectionResult` | All vehicle detections |
-| `persons` | `PersonDetectionResult` | All person detections |
-| `plates` | `ANPRResult` | All number plate readings |
-| `faces` | `list[FaceResult]` | All face detections + watchlist matches |
-| `alerts` | `list[dict]` | Face watchlist hit alerts |
+## 5. File-by-File Reference
 
-**`SmartCityPipeline` constructor args:**
+### main.py — FastAPI Server
 
-| Arg | Default | Description |
-|-----|---------|-------------|
-| `camera_id` | `"cam_01"` | Camera identifier |
-| `vehicle_model_size` | `"yolov8m"` | YOLOv8 variant (n/s/m/l/x) |
-| `face_ctx_id` | `-1` | InsightFace context: -1 = CPU, 0 = GPU |
-| `day_night_weights` | `None` | Optional custom day/night weights |
-| `face_sim_threshold` | `0.55` | Cosine similarity threshold for watchlist match |
-| `anpr_interval` | `5` | Run ANPR every N frames (0 = every frame) |
-| `inference_max_side` | `960` | Resize longer edge before inference (0 = disabled) |
-| `face_det_size` | `320` | InsightFace detection grid (320 or 640) |
-| `n_threads` | `4` | Parallel inference workers |
-| `plate_model_path` | `None` | Path to fine-tuned YOLO plate detector (None → contour heuristic) |
-| `anpr_min_confidence` | `0.10` | Minimum OCR confidence for a plate reading |
-| `enhance_gamma` | `True` | Enable the Gamma Correction stage in the enhancement chain |
-| `enhance_clahe` | `True` | Enable the CLAHE stage in the enhancement chain |
-| `enhance_zero_dce` | `True` | Enable the Zero-DCE++ stage in the enhancement chain |
-| `gamma_target_mean` | `128.0` | Target mean luminance (0–255) the adaptive gamma stage aims for |
-| `clahe_clip_limit` | `3.0` | CLAHE contrast clip threshold |
-| `clahe_tile_grid_size` | `(8, 8)` | CLAHE tile grid size |
-| `zero_dce_weights_path` | `None` | Override path to Zero-DCE++ `.pth` (None → package default) |
-| `zero_dce_scale_factor` | `12` | Zero-DCE++ internal downscale factor |
-| `zero_dce_device` | `"cpu"` | Device for the Zero-DCE++ CNN stage |
+Entry point. Loads SmartCityPipeline once at startup via lifespan(). Routes all HTTP and WS requests.
+
+Key globals:
+-  — singleton SmartCityPipeline instance
+-  — deque(maxlen=500) of FrameEvent dicts
+-  — deque(maxlen=200) of alert dicts
+-  — set of active WebSocket connections
+-  — dict tracking running/source/camera_id/frame_count/error
+-  — bytes of last annotated JPEG (written by stream worker, read by /stream/mjpeg)
+
+Key functions:
+-  — async background loop: reads frames from cv2.VideoCapture, calls process_frame, annotates, caches JPEG
+-  — async generator yielding multipart MJPEG chunks at ~30fps
+-  — pushes _ws_snapshot() to all connected WS clients
+-  — builds {stream_status, latest_event, alerts} dict
+-  — OpenCV fast path + Pillow fallback for HEIC/HEIF/AVIF
+-  — appends to buffers and fires _broadcast_update()
 
 ---
 
-### `clashifiers/day_night/main.py` — Day/Night Classifier
+### pipeline.py — SmartCityPipeline
 
-**Model:** MobileNetV2 (ImageNet pretrained, frozen backbone)  
-**Input:** BGR numpy array (any resolution)  
-**Output:** `{ label, confidence, route_to_enhancement, method }`
+Owns every model. process_frame() is the single call that runs the full AI pipeline on one BGR frame.
 
-**Two-stage strategy:**
-1. **Brightness heuristic** — computes mean greyscale brightness. If ≥ 160 → day, if ≤ 60 → night. Instant, no GPU needed.
-2. **CNN** — MobileNetV2 with a `1280 → 256 → 2` classification head. Runs only for ambiguous twilight (brightness 60–160).
+Constructor args:
+- camera_id=cam_01, vehicle_model_size=yolov8m, face_ctx_id=-1 (CPU)
+- face_sim_threshold=0.70, body_sim_threshold=0.82, body_match_min_margin=0.06
+- anpr_interval=1 (every frame), inference_max_side=0 (disabled)
+- face_det_size=320 (base, adaptive_detect scales up)
+- enhance_gamma=True, enhance_clahe=True, enhance_zero_dce=True
+- gamma_target_mean=128.0, clahe_clip_limit=3.0
+- plate_model_path=weights/license_plate_yolov8n.pt
+- n_threads=4
 
-**Classes:**
-- `DayNightModel(nn.Module)` — MobileNetV2 backbone + custom binary head
-- `DayNightClassifier` — Public inference class. `predict(frame) → dict`
-- `fine_tune(train_dir, model_path_out)` — Fine-tunes on `day/` and `night/` image folders
+Models loaded at startup:
+1. PersonReIdentifier (OSNet x1_0)
+2. PersonRegistry (pgvector, PostgreSQL)
+3. DayNightClassifier (MobileNetV2)
+4. VehicleDetector (YOLOv8m + BotSORT)
+5. FaceRecogniser (InsightFace buffalo_l)
+6. ZeroDCEEnhancer (Gamma+CLAHE+Zero-DCE++)
+7. PersonDetector (YOLOv8m + BotSORT)
+8. ANPRService (YOLOv11n + EasyOCR)
+9. DehazingService (DCP+MSRCR)
+10. ThreadPoolExecutor (4 workers for parallel vehicle detection)
 
-**Route:** `POST /classify/day-night`
-
----
-
-### `clashifiers/vechile_detector/main.py` — Vehicle Detector
-
-**Model:** YOLOv8m (COCO pretrained, `yolov8m.pt` auto-downloaded)  
-**Input:** BGR numpy array  
-**Output:** `VehicleDetectionResult`
-
-**COCO classes used:**
-
-| ID | Label |
-|----|-------|
-| 2 | car |
-| 3 | motorcycle |
-| 5 | bus |
-| 7 | truck |
-| 1 | bicycle (optional, off by default) |
-
-**Dataclasses:**
-- `VehicleDetection` — `{ bbox, label, confidence, class_id, track_id, center, area }`
-- `VehicleDetectionResult` — `{ frame_id, camera_id, total, vehicle_count, detections[] }`
-
-**Class:** `VehicleDetector`
-- `detect(frame, frame_id, camera_id)` — runs YOLOv8 with ByteTrack tracking
-- `draw(frame, result)` — draws bounding boxes + labels + counts on frame
-- `fine_tune(data_yaml)` — fine-tune on custom YOLO-format traffic data
-
-**Route:** `POST /detect/vehicles`
+FrameEvent dataclass fields:
+- frame_id, camera_id, timestamp, day_night (dict), enhanced (bool)
+- vehicles (VehicleDetectionResult), persons (PersonDetectionResult)
+- plates (ANPRResult), faces (list of dicts), identified_people (list)
+- alerts (list of face_watchlist_hit + person_registry_hit dicts)
 
 ---
 
-### `clashifiers/person_detector/main.py` — Person Detector
+### pg_vector.py — PersonRegistry
 
-**Model:** YOLOv8m (same `yolov8m.pt`, COCO class 0 = person)  
-**Input:** BGR numpy array  
-**Output:** `PersonDetectionResult`
+Single source of truth for all person identity. Backed by PostgreSQL + pgvector extension.
 
-**Reuses the already-loaded YOLOv8m model** — no extra weights file needed.
+Database tables (created by pgvector_setup.sql):
+- persons(person_id UUID, name TEXT)
+- face_embeddings(id, person_id, embedding vector(512))
+- body_embeddings(id, person_id, embedding vector(2048))
 
-**Dataclasses:**
-- `PersonDetection` — `{ bbox, confidence, track_id, frame_id, center, area, width, height }`
-- `PersonDetectionResult` — `{ frame_id, camera_id, person_count, detections[] }`
+Key methods:
+- add_person(name, images, face_recogniser, person_detector, reidentifier) → RegistrationOutcome
+  - Deduplicates by name (case-insensitive) before creating new person_id
+  - Extracts ArcFace embedding (face) + OSNet embedding (body) per image
+- match_face(embedding) → (person_dict, similarity) — cosine via pgvector <=> operator
+- match_body(embedding, crop_shape) — TOP-2 neighbours + margin check (rejects ambiguous matches)
+- identify(face_embedding, body_embedding, body_crop_shape) — face-first priority
+  - If face found but no match → returns None (does NOT fall back to body)
+  - Body matching only fires when face_embedding is None entirely
+- list_people() → list with face_refs and body_refs counts
+- remove(person_id) → bool
 
-**Class:** `PersonDetector`
-- `detect(frame, frame_id, camera_id)` — detects people with ByteTrack tracking
-- `draw(frame, result)` — draws orange bounding boxes + person count overlay
-
-**Routes:** `POST /detect/persons`
-
----
-
-### `clashifiers/face_recognization/main.py` — Face Recogniser
-
-**Model:** InsightFace `buffalo_l` pack (~300MB, auto-downloaded)  
-**Input:** BGR numpy array  
-**Output:** `list[FaceResult]`
-
-**Three-stage pipeline:**
-1. **RetinaFace** — detects faces + 5 facial landmarks
-2. **ArcFace** — generates 512-dimensional identity embedding per face
-3. **Cosine similarity** — matches against in-memory `Watchlist`
-
-**Dataclasses:**
-- `DetectedFace` — `{ bbox, confidence, landmarks, embedding }`
-- `WatchlistMatch` — `{ person_id, name, similarity, is_match }`
-- `FaceResult` — combines `DetectedFace` + `WatchlistMatch` + `alert` flag
-
-**Classes:**
-- `Watchlist` — in-memory dict of `person_id → Person`. Methods: `add_person()`, `add_from_photo()`, `search()`, `remove()`, `save()` / `load()` (JSON)
-- `FaceRecogniser` — wraps InsightFace with `recognise(frame, watchlist)` and `draw()`
-
-> **Scale note:** Watchlist uses brute-force cosine search. For large-scale deployments, integrate FAISS or Milvus.
-
-**Routes:** `POST /watchlist/add`, `DELETE /watchlist/{person_id}`, `GET /watchlist`
+Thresholds:
+- face_sim_threshold=0.70 (cosine similarity)
+- body_sim_threshold=0.82 (raised from 0.50 to reduce false positives)
+- body_match_min_margin=0.06 (gap between best and second-best body match)
 
 ---
 
-### `services/classical_enhance.py` — Gamma Correction + CLAHE
+### clashifiers/identity_resolver.py — IdentityResolver
 
-**Purpose:** Lightweight, CPU-only, model-free enhancement building blocks used by `ZeroDCEEnhancer`. No weights, no GPU, sub-millisecond per frame at 1080p.
+Stateless per-frame identity resolver used by POST /analyse/identify. Centralises the face+body binding logic so the REST endpoint and the live pipeline use identical logic.
 
-**Functions:**
+Steps per frame:
+1. PersonDetector.detect() → body bboxes
+2. FaceRecogniser.adaptive_detect() → face detections
+3. Spatial face→body binding (face centre inside body bbox, greedy by confidence)
+4. Body Re-ID embeddings (only if enable_body_matching=True, default=False)
+5. PersonRegistry.identify() per bound person (face-first)
+6. Unbound faces (face detected but no body bbox matched) matched separately
 
-| Function | Description |
-|----------|-------------|
-| `gamma_correction(frame, gamma=1.5)` | Brightens (`gamma > 1`) or darkens (`gamma < 1`) via a 256-entry LUT |
-| `estimate_gamma(frame, target_mean=128.0)` | Picks a gamma value from the frame's current mean luminance so it moves toward `target_mean`. Dark frames → gamma > 1; overexposed frames → gamma < 1 |
-| `clahe_enhance(frame, clip_limit=3.0, tile_grid_size=(8,8))` | Applies CLAHE to the L channel of LAB colour space — boosts local contrast while leaving colour untouched |
-| `auto_enhance(frame, ...)` | Combined helper: adaptive gamma → CLAHE in one call. Returns `{ frame, gamma, method }` |
-
----
-
-### `services/zero_dce.py` — Night Image Enhancer (Chained Pipeline)
-
-**Purpose:** Enhances low-light / night frames before detection runs on them.
-
-**Pipeline — every enabled stage runs in sequence, each stage's output feeding the next:**
-
-```
-raw frame
-    │
-    ▼
-1. Gamma Correction   — adaptive, fixes GLOBAL exposure
-    │
-    ▼
-2. CLAHE               — fixes LOCAL contrast (colour-preserving, LAB L-channel)
-    │
-    ▼
-3. Zero-DCE++ (CNN)    — final deep-learned refinement pass
-    │
-    ▼
-enhanced frame
-```
-
-Any stage can be disabled individually via constructor flags. If the Zero-DCE++ stage is enabled but its weights are missing/broken, that stage alone is skipped (with a one-time startup warning) — the gamma and CLAHE stages still run, so the pipeline never crashes for lack of model weights. This replaces the old "CLAHE as fallback" behaviour: CLAHE now always runs as a permanent stage rather than only substituting for a missing model.
-
-**Class:** `ZeroDCEEnhancer`
-
-| Arg | Default | Description |
-|-----|---------|-------------|
-| `weights_path` | `Epoch99.pth` | Path to pretrained Zero-DCE++ weights |
-| `scale_factor` | `12` | Zero-DCE++ downscale factor (1 = full res, 12 = paper default) |
-| `device` | `"cpu"` | `cpu` / `cuda` / `cuda:0` |
-| `enable_gamma` | `True` | Run the Gamma Correction stage |
-| `enable_clahe` | `True` | Run the CLAHE stage |
-| `enable_zero_dce` | `True` | Run the Zero-DCE++ stage |
-| `gamma_target_mean` | `128.0` | Target mean luminance (0–255) for the adaptive gamma stage |
-| `clahe_clip_limit` | `3.0` | CLAHE contrast clip threshold |
-| `clahe_tile_grid_size` | `(8, 8)` | CLAHE tile grid size |
-
-**Methods / properties:**
-- `enhance(frame)` — BGR in → BGR out, runs every enabled stage in order
-- `last_stages_applied` — list of stages that actually ran on the last frame, e.g. `["gamma", "clahe", "zero_dce"]` (Zero-DCE++ dropped automatically if weights unavailable)
-- `last_gamma` — the adaptive gamma value used on the last frame (`None` if the gamma stage was disabled)
-- `method` property — human-readable summary of the last run, e.g. `"gamma[1.62]+clahe+zero_dce"`
-
-**Route:** `POST /enhance/frame` (response headers: `X-Enhancement-Method`, `X-Stages-Applied`, `X-Gamma-Used`)
+Output: { frame_id, camera_id, person_count, people[], unbound_faces[] }
 
 ---
 
-### `services/anpr.py` — Automatic Number Plate Recognition
+### clashifiers/day_night/main.py — DayNightClassifier
 
-**Purpose:** Detects and reads vehicle number plates in an image.
+Two-stage classifier:
+1. Brightness heuristic (instant, no model):
+   - mean >= 160 → day, skip enhancement
+   - mean <= 85  → night, route to enhancement  (DARK_THRESH raised from 60→85)
+   - 86–159      → MobileNetV2 CNN decides
+2. MobileNetV2 CNN (1280→256→2 head, ImageNet pretrained, not fine-tuned)
 
-**Two-stage pipeline:**
-
-**Stage 1 — Plate Localisation:**
-- If a custom YOLO `.pt` is provided → uses it
-- Otherwise → contour + aspect-ratio heuristic (no extra weights needed)
-  - Canny edge detection → contour finding → filter by area (0.05%–5% of frame) and aspect ratio (1.5–6.0)
-
-**Stage 2 — OCR:**
-- **EasyOCR** (preferred — `pip install easyocr`, ~100MB model on first use)
-- **pytesseract** fallback if EasyOCR not installed
-- ROI preprocessing: 2× upscale + sharpening + Otsu threshold for better accuracy
-- `cleaned_text` = uppercase alphanumeric only (e.g. `MH12AB1234`)
-
-**Dataclasses:**
-- `PlateReading` — `{ bbox, raw_text, cleaned_text, confidence, frame_id }`
-- `ANPRResult` — `{ frame_id, camera_id, plate_count, ocr_engine, plates[] }`
-
-**Class:** `ANPRService`
-- `read_plates(frame, frame_id, camera_id)` → `ANPRResult`
-- `draw(frame, result)` → annotated BGR frame with plate boxes + text
-
-**Routes:** `POST /anpr/read`, `POST /anpr/read/annotated`
+Output: { label, confidence, route_to_enhancement, method }
 
 ---
 
-### `services/dehazing.py` — Image Dehazing
+### clashifiers/face_recognization/main.py — FaceRecogniser
 
-**Purpose:** Converts hazy / foggy / smoky images to clearly visible output.
+Three-stage pipeline:
+1. _preprocess_for_face_detection() — CLAHE on LAB L-channel (always-on, ~0.5ms)
+2. RetinaFace — face detection + 5 landmarks (det_thresh=0.35, was 0.5)
+3. ArcFace — 512-d identity embedding per detected face
 
-**Auto-selects between two algorithms based on image brightness:**
+adaptive_detect(frame, person_count_hint):
+- 1-2 people → 320px detection grid
+- 3-8 people → 640px grid
+- 9+ people  → 960px grid
+- Retries upward if no faces found at starting size
+- _set_det_size() caches current size → only calls app.prepare() when size actually changes (fixes log spam)
 
-#### Algorithm 1 — Sky-Aware Dark Channel Prior (DCP)
-Used for standard outdoor haze, fog, and smoke.
-
-| Step | What it does |
-|------|-------------|
-| Dark Channel | Min intensity across channels in 15×15 patches |
-| Sky Detection | Identifies bright, low-saturation regions (sky) |
-| Atmospheric Light | Estimated from non-sky hazy pixels (more accurate) |
-| Adaptive Transmission | omega=0.90 for ground, 0.50 for sky — prevents sky blowout |
-| Guided Filter | Edge-preserving refinement (no halo artefacts) |
-| White Balance | Corrects colour cast introduced by DCP |
-| Gamma (0.85) | Restores natural brightness |
-| Contrast Stretch | Per-channel percentile clip for maximum clarity |
-| Unsharp Mask | Recovers sharpness lost during dehazing |
-
-#### Algorithm 2 — MSRCR (Multi-Scale Retinex with Colour Restoration)
-Triggered when mean brightness > 0.72 (overcast sky, milky haze, back-lit scenes where DCP fails).
-
-- Runs Retinex at sigmas [15, 80, 250] → logarithm difference between image and blurred version
-- Applies colour restoration factor to avoid grey output
-- Per-channel percentile normalisation
-
-**Class:** `DehazingService`
-
-| Arg | Default | Description |
-|-----|---------|-------------|
-| `patch_size` | `15` | DCP local patch size |
-| `omega` | `0.90` | Haze removal strength (overridden per-request via `strength` param) |
-| `t_min` | `0.15` | Minimum transmission floor |
-| `gamma` | `0.85` | Output brightness correction |
-| `sharpen` | `0.6` | Unsharp mask strength |
-| `msrcr_thresh` | `0.72` | Brightness above which MSRCR is chosen |
-
-**Dataclass:** `DehazingResult` — `{ dehazed_frame, transmission, atm_light, method }`
-
-**Routes:** `POST /dehaze/frame`, `POST /dehaze/frame/compare`
+Watchlist class (in-memory, legacy) — brute-force cosine search. Production: use pgvector PersonRegistry.
 
 ---
 
-### `Zero-DCE_extension/Zero-DCE++/` — Night Enhancement Model Source
+### clashifiers/person_detector/main.py — PersonDetector
 
-> This is a **cloned external repo** — do not modify. Already integrated via `services/zero_dce.py` as the final stage of the enhancement chain.
+YOLOv8m filtering COCO class 0 (person) with BotSORT tracking.
+
+Enhancements:
+- conf=0.30 (was 0.4), iou=0.50 (was 0.45)
+- tracker=botsort.yaml (was ByteTrack — better occlusion handling)
+- MIN_PERSON_HEIGHT=40px filter in _parse() (kills shadow/bag false positives)
+- adaptive_detect(frame, frame_id, camera_id, person_count_hint):
+  - 0-3 → native resolution (fast path)
+  - 4-8 → upscale to 1280px wide before detection, scale bboxes back
+  - 9+  → upscale to 1920px wide
+
+Dataclasses:
+- PersonDetection: bbox, confidence, track_id, frame_id, center, area, width, height
+- PersonDetectionResult: frame_id, camera_id, person_count, detections[]
+
+---
+
+### clashifiers/person_reid/main.py — PersonReIdentifier
+
+OSNet x1_0 (torchreid) for body appearance embedding.
+- embed(crop) → 2048-dim float32 numpy vector
+- Only called when no face found in person crop (face-first architecture)
+- Used during registration (add_person) and live pipeline (process_frame)
+
+---
+
+### clashifiers/vechile_detector/main.py — VehicleDetector
+
+YOLOv8m with BotSORT tracking, filtering COCO vehicle classes:
+- 2=car, 3=motorcycle, 5=bus, 7=truck
+
+Dataclasses:
+- VehicleDetection: bbox, label, confidence, class_id, track_id, center, area
+- VehicleDetectionResult: frame_id, camera_id, total, vehicle_count (per-class), detections[]
+
+---
+
+### services/classical_enhance.py — Classical Enhancement
+
+CPU-only, model-free building blocks:
+- gamma_correction(frame, gamma) — 256-entry LUT
+- estimate_gamma(frame, target_mean=128.0) — adaptive gamma from current brightness
+- clahe_enhance(frame, clip_limit=3.0, tile_grid_size=(8,8)) — LAB L-channel CLAHE
+- auto_enhance(frame) — gamma + CLAHE in one call
+
+---
+
+### services/zero_dce.py — ZeroDCEEnhancer
+
+Chains three enhancement stages in order, each feeding the next:
+1. Gamma Correction (adaptive, target_mean=128.0)
+2. CLAHE (clip=3.0, tile=8x8, LAB L-channel)
+3. Zero-DCE++ CNN (Epoch99.pth, scale_factor=12)
+
+Any stage can be disabled via constructor flags. Zero-DCE++ stage auto-skips if weights missing.
+
+Properties: method, last_stages_applied, last_gamma
+
+---
+
+### services/anpr.py — ANPRService
+
+Two-stage plate recognition:
+Stage 1 — Localisation:
+- YOLOv11n fine-tuned plate detector (if weights present)
+- Contour heuristic fallback (Canny → contour → aspect-ratio filter 1.5–6.0)
+Stage 2 — OCR:
+- EasyOCR (preferred, ~100MB download on first use)
+- pytesseract fallback
+- ROI preprocessing: 2× upscale + sharpening + Otsu threshold
+- cleaned_text = uppercase alphanumeric only (e.g. MH12AB1234)
+
+Restricted to vehicle bounding boxes in pipeline to reduce false positives.
+
+Dataclasses:
+- PlateReading: bbox, raw_text, cleaned_text, confidence, frame_id
+- ANPRResult: frame_id, camera_id, plate_count, ocr_engine, plates[]
+
+---
+
+### services/dehazing.py — DehazingService
+
+Auto-selects algorithm based on frame brightness:
+- mean <= 0.72 → Sky-Aware DCP (Dark Channel Prior)
+  - 15×15 dark channel → sky detection → adaptive omega (0.90 ground, 0.50 sky)
+  - Guided filter → white balance → gamma(0.85) → contrast stretch → unsharp mask
+- mean > 0.72 → MSRCR (Multi-Scale Retinex with Colour Restoration)
+  - Retinex at sigmas [15, 80, 250] → colour restoration → percentile normalise
+
+Dataclass: DehazingResult: dehazed_frame, transmission, atm_light, method
+
+---
+
+### Zero-DCE_extension/Zero-DCE++/ — External Repo
+
+Cloned external repo. Do not modify directly.
 
 | File | Purpose |
-|------|---------|
-| `model.py` | `enhance_net_nopool` — 7-layer depthwise-sep CNN with U-Net skip connections |
-| `Myloss.py` | `L_color`, `L_spa`, `L_exp`, `L_TV` loss functions for unsupervised training |
-| `dataloader.py` | `lowlight_loader` — PyTorch Dataset loading 512×512 low-light images |
-| `lowlight_train.py` | Training script (100 epochs, requires CUDA) |
-| `lowlight_test.py` | Inference script — processes `test_data/` folder |
-| `snapshots_Zero_DCE++/Epoch99.pth` | Pretrained weights used by `ZeroDCEEnhancer` |
-
----
-
-## 5. Architecture Diagram
-
-```mermaid
-graph TB
-    subgraph Client["Client (Dashboard / IoT Camera)"]
-        C1["Image Upload"]
-        C2["Base64 JSON"]
-        C3["RTSP Stream URL"]
-    end
-
-    subgraph API["main.py — FastAPI Server"]
-        R1["POST /analyse/frame"]
-        R2["POST /classify/day-night"]
-        R3["POST /enhance/frame"]
-        R4["POST /detect/vehicles"]
-        R5["POST /detect/persons"]
-        R6["POST /anpr/read"]
-        R7["POST /dehaze/frame"]
-        R8["POST /stream/start"]
-        EB["Event Buffer (×500)"]
-        AB["Alert Buffer (×200)"]
-    end
-
-    subgraph PL["pipeline.py — SmartCityPipeline"]
-        PF["process_frame()"]
-    end
-
-    subgraph CL["clashifiers/"]
-        DN["DayNightClassifier\nMobileNetV2"]
-        VD["VehicleDetector\nYOLOv8m + ByteTrack"]
-        PD["PersonDetector\nYOLOv8m class-0"]
-        FR["FaceRecogniser\nRetinaFace + ArcFace"]
-        WL["Watchlist\nin-memory embeddings"]
-    end
-
-    subgraph SV["services/"]
-        CE["classical_enhance.py\nGamma Correction + CLAHE"]
-        ZD["ZeroDCEEnhancer\nGamma -> CLAHE -> Zero-DCE++"]
-        AN["ANPRService\nContour + EasyOCR"]
-        DH["DehazingService\nDCP + MSRCR"]
-    end
-
-    C1 --> R1
-    C2 --> R1
-    C3 --> R8
-    R1 --> PF
-    R2 --> DN
-    R3 --> ZD
-    R4 --> VD
-    R5 --> PD
-    R6 --> AN
-    R7 --> DH
-    PF --> DN
-    PF --> ZD
-    ZD --> CE
-    PF --> VD
-    PF --> PD
-    PF --> AN
-    PF --> FR
-    FR --> WL
-    PF --> EB
-    PF --> AB
-```
+|---|---|
+| model.py | enhance_net_nopool — 7-layer depthwise-sep CNN with U-Net skip connections |
+| Myloss.py | L_color, L_spa, L_exp, L_TV unsupervised loss functions |
+| dataloader.py | lowlight_loader — 512×512 low-light image dataset |
+| lowlight_train.py | Training (CUDA, 100 epochs) |
+| lowlight_test.py | Inference on test_data/ folder |
+| snapshots_Zero_DCE++/Epoch99.pth | Pretrained weights used by ZeroDCEEnhancer |
 
 ---
 
@@ -547,114 +478,65 @@ graph TB
 
 ```
 main.py
-  └── pipeline.py
-        ├── clashifiers/day_night/main.py          → DayNightClassifier
-        ├── clashifiers/vechile_detector/main.py   → VehicleDetector, VehicleDetectionResult
-        ├── clashifiers/face_recognization/main.py → FaceRecogniser, Watchlist, FaceResult
-        ├── clashifiers/person_detector/main.py    → PersonDetector, PersonDetectionResult
-        ├── services/zero_dce.py                   → ZeroDCEEnhancer
-        ├── services/anpr.py                       → ANPRService, ANPRResult
-        └── services/dehazing.py                   → DehazingService
+  ├── pipeline.py
+  │     ├── clashifiers/day_night/main.py           → DayNightClassifier
+  │     ├── clashifiers/vechile_detector/main.py    → VehicleDetector
+  │     ├── clashifiers/face_recognization/main.py  → FaceRecogniser
+  │     ├── clashifiers/person_detector/main.py     → PersonDetector
+  │     ├── clashifiers/person_reid/main.py         → PersonReIdentifier
+  │     ├── pg_vector.py                            → PersonRegistry
+  │     ├── services/zero_dce.py                    → ZeroDCEEnhancer
+  │     ├── services/anpr.py                        → ANPRService
+  │     └── services/dehazing.py                    → DehazingService
+  └── clashifiers/identity_resolver.py              → IdentityResolver
 
 services/zero_dce.py
-  ├── services/classical_enhance.py               → gamma_correction, estimate_gamma, clahe_enhance
-  └── Zero-DCE_extension/Zero-DCE++/model.py      → enhance_net_nopool
+  ├── services/classical_enhance.py
+  └── Zero-DCE_extension/Zero-DCE++/model.py
 ```
 
 ---
 
-## 7. Running the Server
+## 7. Alert Types (WebSocket + /alerts)
+
+| Alert type | When fired | Key fields |
+|---|---|---|
+| face_watchlist_hit | Face ArcFace embedding matches a registered person above face_sim_threshold | type, person_id, name, similarity, frame_id, camera_id, timestamp |
+| person_registry_hit | Body or face binding in process_frame matches via PersonRegistry.identify() | type, person_id, name, similarity, method (face/body), track_id, frame_id |
+
+---
+
+## 8. Running the Server
 
 ```bash
-# 1. Enter py-server directory
 cd py-server
-
-# 2. Activate virtual environment
 source .venv/bin/activate
-
-# 3. Install dependencies
 pip install -r requirements.txt
-pip install easyocr          # for ANPR OCR
 
-# 4. Start the server (with hot-reload)
+# PostgreSQL + pgvector must be running
+psql -U postgres -d smart_city -f pgvector_setup.sql
+
+# Start server
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-# 5. Open Swagger UI
+# Swagger UI
 # http://localhost:8000/docs
 ```
 
 ---
 
-## 8. Key Design Decisions
+## 9. Key Design Decisions
 
 | Decision | Rationale |
-|----------|-----------|
-| All models loaded **once at startup** | Avoids per-request model load time (~10–30s per model) |
-| YOLOv8m shared between vehicle + person detector | One `.pt` file, two class-filtered inference calls |
-| Night enhancement is a **chained pipeline**, not a single fallback | Gamma Correction fixes global exposure, CLAHE fixes local contrast, Zero-DCE++ adds a final deep-learned pass — each stage compensates for what the previous one leaves behind. If Zero-DCE++ weights are missing, only that stage is skipped; the classical stages still run, so the pipeline never crashes |
-| EasyOCR with pytesseract fallback | Flexible OCR with graceful degradation |
-| DCP auto-selects MSRCR for bright scenes | DCP fails on sky-dominant images — MSRCR handles them better |
-| In-memory event/alert buffers | Low-latency, no DB dependency for live dashboard |
-| ByteTrack for tracking | Maintains consistent IDs across frames for counting and trajectory analysis |
-| CORS enabled for `*` | Development mode — restrict to dashboard origin in production |
-
----
-
-## 9. Response Shape Reference
-
-### Full Pipeline Response (`/analyse/frame`)
-
-```json
-{
-  "frame_id": "frame_000001",
-  "camera_id": "cam_01",
-  "timestamp": 1719654000.123,
-  "day_night": {
-    "label": "night",
-    "confidence": 0.94,
-    "route_to_enhancement": true,
-    "method": "heuristic"
-  },
-  "enhanced": true,
-  "vehicles": {
-    "frame_id": "frame_000001",
-    "camera_id": "cam_01",
-    "total": 3,
-    "vehicle_count": { "car": 2, "truck": 1 },
-    "detections": [
-      { "bbox": [120, 80, 340, 200], "label": "car", "confidence": 0.91,
-        "class_id": 2, "track_id": 7, "center": [230, 140], "area": 24200 }
-    ]
-  },
-  "persons": {
-    "frame_id": "frame_000001",
-    "camera_id": "cam_01",
-    "person_count": 2,
-    "detections": [
-      { "bbox": [50, 60, 130, 280], "confidence": 0.87,
-        "track_id": 3, "center": [90, 170], "area": 17600, "width": 80, "height": 220 }
-    ]
-  },
-  "plates": {
-    "frame_id": "frame_000001",
-    "camera_id": "cam_01",
-    "plate_count": 1,
-    "ocr_engine": "easyocr",
-    "plates": [
-      { "bbox": [140, 180, 260, 210], "raw_text": "MH 12 AB 1234",
-        "cleaned_text": "MH12AB1234", "confidence": 0.82 }
-    ]
-  },
-  "faces": [
-    {
-      "face": { "bbox": [300, 40, 380, 140], "confidence": 0.97, "landmarks": [...] },
-      "match": { "person_id": "P001", "name": "John Doe", "similarity": 0.79, "is_match": true },
-      "alert": true
-    }
-  ],
-  "alerts": [
-    { "type": "face_watchlist_hit", "person_id": "P001", "name": "John Doe",
-      "similarity": 0.79, "frame_id": "frame_000001", "camera_id": "cam_01", "timestamp": 1719654000.123 }
-  ]
-}
-```
+|---|---|
+| Single source of truth: pgvector PersonRegistry | Old Watchlist (in-memory) and PersonRegistry disagreed on same photo. Now one store for face+body identity. |
+| Face-first, body-fallback identity | If face detected but no match → Unknown. Never fall back to body matching when face visible — body Re-ID has high FP rate |
+| Body margin check (top-2 neighbours) | Single threshold cannot separate true matches from false positives in group photos. Margin check rejects ambiguous results |
+| Always-on CLAHE before face detection | Day/Night classifier misses slightly dark frames (indoor, shade). CLAHE runs ~0.5ms on CPU, improves RetinaFace recall without waiting for night classification |
+| DARK_THRESH raised 60→85 | Frames 61–85 mean brightness (indoor lighting) now route to full enhancement chain instead of the untrained CNN |
+| BotSORT over ByteTrack | BotSORT maintains track IDs through occlusion (person behind pole/car) more reliably |
+| adaptive_detect for persons + faces | Upscales frame before detection when crowd is dense — catches small/distant people that YOLO misses at native resolution |
+| Min-height filter 40px | Prevents bags, shadows, partial blobs from being counted as persons at the lower conf threshold |
+| ANPR restricted to vehicle boxes | Prevents false plate reads from signs, graffiti, building numbers in background |
+| ThreadPoolExecutor for vehicle detection | Vehicle detection runs in parallel with person+face detection — hides its latency |
+| MJPEG + WebSocket dual output | MJPEG for video frames (img tag compatible), WebSocket for structured JSON events — both fed by same _stream_worker loop |

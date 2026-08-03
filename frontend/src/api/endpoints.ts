@@ -94,10 +94,44 @@ export const getStreamStatus = () =>
   api.get<StreamStatus>("/stream/status").then((r) => r.data);
 
 // ── Watchlist / Person Registry ──────────────────────────────────
-export const addToWatchlist = (person_id: string, name: string, photo: File) =>
-  api
-    .post("/watchlist/add", fileForm(photo, { person_id, name }))
-    .then((r) => r.data);
+/**
+ * Add or update a person in the watchlist.
+ * Matches POST /watchlist/add exactly:
+ *   - multipart/form-data
+ *   - "name"          → required string
+ *   - "files"         → one or more File objects (field name MUST be "files")
+ *   - "person_id"     → optional; pass back to merge more photos into an existing person
+ *   - "night_augment" → optional bool (defaults true server-side)
+ */
+export const addPersonToWatchlist = ({
+  name,
+  files,
+  personId = null,
+  nightAugment = true,
+}: {
+  name: string;
+  files: File[];
+  personId?: string | null;
+  nightAugment?: boolean;
+}) => {
+  if (!name.trim()) throw new Error("name is required");
+  if (!files.length) throw new Error("at least one file is required");
+
+  const fd = new FormData();
+  fd.append("name", name);
+
+  // Field MUST be "files" (plural) — one append per file.
+  // Do NOT set Content-Type manually; the browser sets the correct
+  // multipart boundary automatically.
+  for (const file of files) fd.append("files", file);
+
+  if (personId) fd.append("person_id", personId);
+
+  // FastAPI bool coercion handles the "true"/"false" strings correctly.
+  fd.append("night_augment", nightAugment ? "true" : "false");
+
+  return api.post<AddPersonOutcome>("/watchlist/add", fd).then((r) => r.data);
+};
 
 export const removeFromWatchlist = (person_id: string) =>
   api.delete(`/watchlist/${person_id}`).then((r) => r.data);
@@ -117,13 +151,13 @@ export const clearBuffers = () => api.delete("/events").then((r) => r.data);
 // ── Person Registry ───────────────────────────────────────────────
 // All three routes map to /watchlist/* — the backend now serves the
 // pgvector registry through those endpoints (Watchlist was removed).
-export const addRegistryPerson = (name: string, images: File[]) => {
-  const fd = new FormData();
-  fd.append("name", name);
-  // Field MUST be 'files' to match the FastAPI route: files: List[UploadFile]
-  for (const img of images) fd.append("files", img);
-  return api.post<AddPersonOutcome>("/watchlist/add", fd).then((r) => r.data);
-};
+/** Thin alias kept for backward-compat with persons.tsx — delegates to addPersonToWatchlist. */
+export const addRegistryPerson = (
+  name: string,
+  images: File[],
+  personId?: string | null,
+  nightAugment = true,
+) => addPersonToWatchlist({ name, files: images, personId, nightAugment });
 
 export const removeRegistryPerson = (person_id: string) =>
   api.delete(`/watchlist/${person_id}`).then((r) => r.data);

@@ -183,12 +183,11 @@ class FaceRecogniser:
 
     def __init__(
         self,
-        det_thresh : float = 0.5,
+        det_thresh : float = 0.35,   # ↓ from 0.5 — better recall on dim/occluded faces
         det_size   : tuple = (640, 640),
         ctx_id     : int   = 0,           # -1 = CPU
     ):
         self.det_thresh = det_thresh
-        self._det_size  = det_size[0]   # store scalar for adaptive_detect restores
         self._load(ctx_id, det_size)
 
     def _load(self, ctx_id: int, det_size: tuple):
@@ -205,10 +204,56 @@ class FaceRecogniser:
                 "     (or onnxruntime for CPU-only)"
             )
 
+    def _resize_for_det_size(self, frame: np.ndarray, target_size: int) -> np.ndarray:
+        """Scale a frame so its longer side equals target_size, preserving
+        aspect ratio.  This simulates different detection grid sizes WITHOUT
+        calling app.prepare() a second time, which corrupts InsightFace's ONNX
+        session _inputs_meta and causes TypeError: 'NoneType' is not iterable.
+        """
+        h, w = frame.shape[:2]
+        longer = max(h, w)
+        if longer == target_size:
+            return frame
+        scale = target_size / longer
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        interp = cv2.INTER_LINEAR if scale > 1 else cv2.INTER_AREA
+        return cv2.resize(frame, (new_w, new_h), interpolation=interp)
+
+    @staticmethod
+    def _preprocess_for_face_detection(frame: np.ndarray) -> np.ndarray:
+        """
+        Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to the
+        luminance channel before feeding the frame to RetinaFace.
+
+        This is always-on and extremely cheap (pure CPU, no deep learning).
+        It boosts contrast specifically in dim or shadow areas where faces live,
+        without distorting colours (only the L channel in LAB space is touched).
+
+        Why this helps:
+          - Day/Night classifier only triggers full Zero-DCE enhancement for
+            obvious night frames (mean < 60px). Slightly dark frames (indoor
+            lighting, shade, overcast) are classified as 'day' and get no
+            enhancement at all — RetinaFace then misses those faces.
+          - CLAHE is deterministic and adds ~0.5ms per frame on CPU, making it
+            safe to run every single frame without affecting throughput.
+        """
+        # Convert to LAB, equalize only the L (lightness) channel
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l_eq  = clahe.apply(l_channel)
+        lab_eq = cv2.merge([l_eq, a_channel, b_channel])
+        return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def detect(self, frame: np.ndarray) -> list[DetectedFace]:
-        """Detect all faces in a BGR frame and return with ArcFace embeddings."""
+        """Detect all faces in a BGR frame and return with ArcFace embeddings.
+        Applies CLAHE luminance normalization before detection to improve recall
+        in dim/shadow/indoor-lighting conditions.
+        """
+        frame = self._preprocess_for_face_detection(frame)
         results = []
         for f in self.app.get(frame):
             if f.det_score < self.det_thresh:
@@ -236,17 +281,20 @@ class FaceRecogniser:
         sizes: tuple = (320, 640, 960),
     ) -> list[DetectedFace]:
         """
-        Retry face detection with progressively larger detection grids until
-        at least one face is found, or until all sizes have been tried.
+        Retry face detection at progressively larger effective scales until at
+        least one face is found, or until all sizes have been tried.
 
-        Heuristic: choose the starting grid size based on crowd size —
+        Instead of calling app.prepare() with different det_sizes (which
+        corrupts InsightFace's ONNX session _inputs_meta and raises
+        TypeError: 'NoneType' is not iterable), we resize the *frame* to
+        match each target scale.  The model's det_size stays fixed at
+        whatever was set in __init__ — a single app.prepare() call, ever.
+
+        Heuristic starting scale:
           1-2 people  → 320  (fast, close-up)
           3-8 people  → 640  (balanced)
           9+ people   → 960  (group/CCTV wide shot)
-
-        If the initial size finds nothing, upscale and retry.
         """
-        # Pick starting index based on crowd size hint
         if person_count_hint >= 9:
             start_idx = 2
         elif person_count_hint >= 3:
@@ -254,15 +302,13 @@ class FaceRecogniser:
         else:
             start_idx = 0
 
+        results: list[DetectedFace] = []
         for size in sizes[start_idx:]:
-            self.app.prepare(ctx_id=0, det_size=(size, size))
-            results = self.detect(frame)
+            scaled = self._resize_for_det_size(frame, size)
+            results = self.detect(scaled)
             if results:
                 break  # found faces — stop retrying
 
-        # Restore original det_size (re-use whatever was set at construction)
-        # Note: if ctx_id is unknown here, 0 works for both CPU and GPU paths
-        self.app.prepare(ctx_id=0, det_size=(self._det_size, self._det_size))
         return results
 
     def recognise(

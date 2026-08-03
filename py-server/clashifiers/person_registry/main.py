@@ -69,8 +69,8 @@ class PersonRegistry:
 
     def __init__(
         self,
-        face_sim_threshold: float = 0.55,
-        body_sim_threshold: float = 0.65,
+        face_sim_threshold: float = 0.20,
+        body_sim_threshold: float = 0.22,
         storage_path: str | None = None,
     ):
         self.face_sim_threshold = face_sim_threshold

@@ -74,8 +74,12 @@ class DayNightClassifier:
     """
 
     LABELS        = ["day", "night"]
-    BRIGHT_THRESH = 160   # mean pixel value → definitely day
-    DARK_THRESH   = 60    # mean pixel value → definitely night
+    BRIGHT_THRESH = 160   # mean pixel value → definitely day, skip enhancement
+    DARK_THRESH   = 85    # ↑ from 60: mean < 85 → route to full enhancement chain
+                          #   Previously 60 left a gap: frames with mean 61–85
+                          #   (indoor, shade, overcast, golden hour) hit the CNN
+                          #   which is untrained and often classifies them as 'day'
+                          #   → no enhancement → RetinaFace misses faces in shadow.
 
     def __init__(
         self,

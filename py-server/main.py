@@ -29,7 +29,12 @@ from PIL import Image, UnidentifiedImageError
 from pipeline import SmartCityPipeline, FrameEvent
 from clashifiers.identity_resolver import IdentityResolver
 
+import logging
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
 pipeline: Optional[SmartCityPipeline] = None
@@ -81,6 +86,17 @@ async def lifespan(app: FastAPI):
         enhance_gamma        = True,
         enhance_clahe         = True,
         enhance_zero_dce      = True,
+        # ── Night enhancement backend ─────────────────────────────────
+        # Switched from Zero-DCE++ to SCI (Self-Calibrated Illumination,
+        # CVPR 2022). Zero-DCE++ optimizes for how the image LOOKS to a
+        # human; SCI was built and benchmarked specifically for how well
+        # the enhanced frame feeds a downstream detector (its own paper
+        # validates this on low-light face detection). The bundled
+        # 'sci_difficult.pt' checkpoint is trained on the DARK FACE
+        # dataset — night CCTV-style scenes of people — which is the
+        # closest match to this pipeline's actual footage.
+        # Set night_enhancement_backend="zero_dce" to revert.
+        night_enhancement_backend = "sci",
         gamma_target_mean     = 128.0,
         clahe_clip_limit      = 3.0,
     )
@@ -182,7 +198,7 @@ async def status():
             "face_recogniser":      "RetinaFace + ArcFace  (InsightFace buffalo_l)",
             "anpr_plate_detector":  "YOLOv11n (fine-tuned)" if (pipeline and pipeline.anpr._yolo_detector is not None) else "contour heuristic (fallback)",
             "night_enhancer":       (
-                "Gamma Correction -> CLAHE -> Zero-DCE++ (chained)"
+                pipeline.enhancer.method
                 if pipeline else "loading"
             ),
         },
@@ -610,9 +626,17 @@ async def stream_single_frame():
 
 @app.post("/watchlist/add", tags=["Watchlist"])
 async def watchlist_add(
-    name      : str                 = Form(..., description="Display name  e.g. 'Sandeep'"),
-    person_id : Optional[str]       = Form(None, description="Existing person_id to add more photos to (optional)"),
-    files     : List[UploadFile]    = File(..., description="One or more reference face / body photos (JPEG / PNG)"),
+    name          : str                 = Form(..., description="Display name  e.g. 'Sandeep'"),
+    person_id     : Optional[str]       = Form(None, description="Existing person_id to add more photos to (optional)"),
+    files         : List[UploadFile]    = File(..., description="One or more reference face / body photos (JPEG / PNG)"),
+    night_augment : bool                = Form(True, description=(
+        "If true (default), also synthesise a night-domain variant of each "
+        "reference photo (darkened + run through the same enhancement chain "
+        "used at inference) and store its embedding alongside the normal "
+        "daylight one. This is what fixes 'known person shows Unknown at "
+        "night' — set to false only if you're troubleshooting and want to "
+        "isolate behaviour to the plain daylight embeddings."
+    )),
 ):
     """
     Add or update a person on the **face watchlist AND person registry**.
@@ -628,6 +652,11 @@ async def watchlist_add(
     Deduplication: if no `person_id` is supplied and a person with the same
     `name` (case-insensitive) already exists in the registry, the new photos
     are merged into that existing entry instead of creating a new one.
+
+    Night recognition fix: each reference photo is also, by default, used to
+    synthesise a night-domain embedding (see `night_augment` above) so this
+    person can still be matched once real night frames get routed through
+    the pipeline's low-light enhancement chain before ArcFace runs.
     """
     decoded_images: list[np.ndarray] = []
     for upload in files:
@@ -643,6 +672,9 @@ async def watchlist_add(
         raise HTTPException(status_code=422, detail="No valid images could be decoded from the uploaded files.")
 
     # ── Register in the full PersonRegistry (pgvector) ───────────────────────
+    # `enhancer=pipeline.enhancer` is what actually enables the night-domain
+    # augmentation implemented in PersonRegistry.add_person() — without this,
+    # add_person() silently skips that step and only stores daylight embeddings.
     outcome = pipeline.person_registry.add_person(
         name=name,
         images=decoded_images,
@@ -650,6 +682,8 @@ async def watchlist_add(
         person_detector=pipeline.person_detector,
         reidentifier=pipeline.reidentifier,
         person_id=person_id,
+        enhancer=pipeline.enhancer,
+        night_augment=night_augment,
     )
 
     if outcome.registry_unavailable:
@@ -670,6 +704,7 @@ async def watchlist_add(
         "name":                   outcome.name,
         "images_received":        outcome.images_received,
         "face_embeddings_added":  outcome.face_embeddings_added,
+        "night_variants_added":   outcome.night_variants_added,
         "body_embeddings_added":  outcome.body_embeddings_added,
         "images_skipped":         outcome.images_skipped,
         "reused_existing_person": outcome.reused_existing_person,

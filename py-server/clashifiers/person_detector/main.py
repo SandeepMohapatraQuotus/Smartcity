@@ -8,6 +8,13 @@ Output : PersonDetectionResult  →  list of PersonDetection per frame
 
 COCO person class used:
     0 → person
+
+Enhancements applied:
+    - conf_threshold lowered 0.4 → 0.30 for better recall on occluded/distant people
+    - iou_threshold raised 0.45 → 0.50 for tighter NMS in dense crowd scenes
+    - BotSORT tracker (vs ByteTrack) for robust ID persistence through occlusion
+    - Minimum bbox height filter to kill shadow/bag false positives
+    - adaptive_detect() method: scales input resolution based on crowd density
 """
 
 import cv2
@@ -96,17 +103,26 @@ class PersonDetector:
     PERSON_CLASS_ID = 0
     BOX_COLOR       = (0, 165, 255)   # orange-ish
 
+    # Minimum bounding-box height (pixels) for a detection to be kept.
+    # Eliminates bags, shadows, and partial-body blobs that YOLO hallucinates
+    # at low confidence thresholds. Tune per camera resolution.
+    MIN_PERSON_HEIGHT = 40
+
     def __init__(
         self,
         model_size      : str   = "yolov8m",
-        conf_threshold  : float = 0.4,
-        iou_threshold   : float = 0.45,
+        conf_threshold  : float = 0.30,   # ↓ from 0.4 — better recall on occluded/distant people
+        iou_threshold   : float = 0.50,   # ↑ from 0.45 — tighter NMS for dense crowd scenes
         enable_tracking : bool  = True,
         device          : str   = "auto",
+        tracker         : str   = "botsort.yaml",  # BotSORT > ByteTrack on occlusion
+        min_person_height: int  = 40,   # px — filter out tiny false-positive blobs
     ):
-        self.conf_threshold  = conf_threshold
-        self.iou_threshold   = iou_threshold
-        self.enable_tracking = enable_tracking
+        self.conf_threshold   = conf_threshold
+        self.iou_threshold    = iou_threshold
+        self.enable_tracking  = enable_tracking
+        self.tracker          = tracker
+        self.MIN_PERSON_HEIGHT = min_person_height
 
         import torch
         self.device = ("cuda" if torch.cuda.is_available() else "cpu") \
@@ -131,7 +147,7 @@ class PersonDetector:
         frame_id  : str = "frame_0",
         camera_id : str = "cam_0",
     ) -> PersonDetectionResult:
-        """Run person detection (+ tracking) on a single BGR frame."""
+        """Run person detection (+ BotSORT tracking) on a single BGR frame."""
         if self.enable_tracking:
             raw = self.model.track(
                 frame,
@@ -139,6 +155,7 @@ class PersonDetector:
                 conf    = self.conf_threshold,
                 iou     = self.iou_threshold,
                 persist = True,
+                tracker = self.tracker,   # BotSORT for better occlusion handling
                 verbose = False,
             )
         else:
@@ -150,6 +167,54 @@ class PersonDetector:
                 verbose = False,
             )
         return self._parse(raw[0], frame_id, camera_id)
+
+    def adaptive_detect(
+        self,
+        frame     : np.ndarray,
+        frame_id  : str = "frame_0",
+        camera_id : str = "cam_0",
+        person_count_hint: int = 0,
+    ) -> "PersonDetectionResult":
+        """
+        Scale the input frame resolution based on crowd density before detection.
+
+        Heuristic (mirrors face recogniser adaptive_detect logic):
+          0-3  people hint → native resolution  (fast path)
+          4-8  people hint → upscale to 1280px wide (balanced)
+          9+   people hint → upscale to 1920px wide (dense crowd / wide CCTV shot)
+
+        Upscaling helps detect small/distant people that YOLO misses at native
+        resolution when they occupy only a few dozen pixels in the frame.
+        """
+        h, w = frame.shape[:2]
+
+        if person_count_hint >= 9:
+            target_w = 1920
+        elif person_count_hint >= 4:
+            target_w = 1280
+        else:
+            # No upscaling needed — run at native resolution
+            return self.detect(frame, frame_id, camera_id)
+
+        if w < target_w:  # only upscale, never downscale here
+            scale   = target_w / w
+            new_w   = target_w
+            new_h   = int(round(h * scale))
+            frame   = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        result = self.detect(frame, frame_id, camera_id)
+
+        # Re-scale bboxes back to original frame coordinates
+        if w < target_w:
+            scale_back = w / target_w
+            for det in result.detections:
+                det.bbox = [
+                    int(det.bbox[0] * scale_back),
+                    int(det.bbox[1] * scale_back),
+                    int(det.bbox[2] * scale_back),
+                    int(det.bbox[3] * scale_back),
+                ]
+        return result
 
     def draw(self, frame: np.ndarray, result: PersonDetectionResult) -> np.ndarray:
         """Return annotated BGR frame with bounding boxes and person count."""
@@ -182,6 +247,11 @@ class PersonDetector:
             if cid != self.PERSON_CLASS_ID:
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+            # ── Min-size filter: skip tiny blobs (shadows, bags, distant noise) ──
+            if (y2 - y1) < self.MIN_PERSON_HEIGHT:
+                continue
+
             detections.append(PersonDetection(
                 bbox       = [x1, y1, x2, y2],
                 confidence = float(box.conf[0]),

@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { UserPlus, Trash2, UserX } from "lucide-react";
+import { ImagePlus, ShieldCheck, Trash2, UserPlus, UserX, X } from "lucide-react";
 import { toast } from "sonner";
 import { PageWrapper, PageHeader } from "@/components/layout/PageHeader";
 import { ImageUploader } from "@/components/shared/ImageUploader";
@@ -29,10 +29,10 @@ import {
 } from "@/components/ui/alert-dialog";
 import {
   getWatchlist,
-  addToWatchlist,
+  addPersonToWatchlist,
   removeFromWatchlist,
 } from "@/api/endpoints";
-import type { WatchlistPerson } from "@/api/types";
+import type { AddPersonOutcome, WatchlistPerson } from "@/api/types";
 
 export const Route = createFileRoute("/watchlist")({
   head: () => ({
@@ -47,10 +47,12 @@ export const Route = createFileRoute("/watchlist")({
 function Watchlist() {
   const [people, setPeople] = useState<WatchlistPerson[]>([]);
   const [open, setOpen] = useState(false);
-  const [personId, setPersonId] = useState("");
   const [name, setName] = useState("");
-  const [photo, setPhoto] = useState<File | null>(null);
+  const [images, setImages] = useState<File[]>([]);
+  const [nightAugment, setNightAugment] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [outcome, setOutcome] = useState<AddPersonOutcome | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   const load = async () => {
     try {
@@ -65,20 +67,44 @@ function Watchlist() {
     load();
   }, []);
 
+  const reset = () => {
+    setName("");
+    setImages([]);
+    setNightAugment(true);
+    setOutcome(null);
+  };
+
+  const addImages = (files: FileList | null) => {
+    if (!files) return;
+    setImages((prev) => [...prev, ...Array.from(files)]);
+  };
+
+  const removeImage = (i: number) =>
+    setImages((prev) => prev.filter((_, idx) => idx !== i));
+
   const add = async () => {
-    if (!personId.trim() || !name.trim() || !photo) {
-      toast.error("Fill all fields and add a photo");
-      return;
-    }
+    if (!name.trim()) return toast.error("Enter a name");
+    if (images.length === 0) return toast.error("Add at least one photo");
     setSaving(true);
     try {
-      await addToWatchlist(personId.trim(), name.trim(), photo);
-      toast.success("Person added");
-      setOpen(false);
-      setPersonId("");
-      setName("");
-      setPhoto(null);
+      const result = await addPersonToWatchlist({
+        name: name.trim(),
+        files: images,
+        nightAugment,
+      });
+      setOutcome(result);
       load();
+      if (result.reused_existing_person) {
+        toast.success(
+          `Merged into existing "${result.name}" (${result.face_embeddings_added}F / ${result.body_embeddings_added}B embeddings added)`,
+        );
+      } else if (result.face_embeddings_added > 0 || result.body_embeddings_added > 0) {
+        toast.success(
+          `Added "${result.name}" (${result.face_embeddings_added}F / ${result.body_embeddings_added}B embeddings)`,
+        );
+      } else {
+        toast.warning(`Partial registration: ${result.errors?.[0] ?? "no usable embeddings"}`);
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to add");
     } finally {
@@ -103,45 +129,161 @@ function Watchlist() {
         endpoint="GET /watchlist · POST /watchlist/add · DELETE /watchlist/{id}"
         description={`${people.length} person${people.length === 1 ? "" : "s"} on watchlist`}
         action={
-          <Dialog open={open} onOpenChange={setOpen}>
+          <Dialog
+            open={open}
+            onOpenChange={(v) => {
+              setOpen(v);
+              if (!v) reset();
+            }}
+          >
             <DialogTrigger asChild>
               <Button>
                 <UserPlus className="mr-2 h-4 w-4" /> Add Person
               </Button>
             </DialogTrigger>
-            <DialogContent>
+            <DialogContent className="max-w-lg">
               <DialogHeader>
                 <DialogTitle>Add to Watchlist</DialogTitle>
               </DialogHeader>
-              <div className="space-y-4">
-                <div className="space-y-1.5">
-                  <Label>Person ID</Label>
-                  <Input
-                    placeholder="P004"
-                    value={personId}
-                    onChange={(e) => setPersonId(e.target.value)}
-                  />
+
+              {outcome ? (
+                /* ── Success state ─────────────────────────────── */
+                <div className="space-y-4 py-2">
+                  <div className="flex items-center gap-3 rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-3">
+                    <ShieldCheck className="h-6 w-6 text-green-400" />
+                    <div>
+                      <p className="font-semibold">{outcome.name}</p>
+                      <p className="font-mono text-xs text-muted-foreground">
+                        {outcome.person_id}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-3 text-center">
+                    {[
+                      { label: "Images", value: outcome.images_received },
+                      { label: "Face emb.", value: outcome.face_embeddings_added },
+                      { label: "Body emb.", value: outcome.body_embeddings_added },
+                    ].map((s) => (
+                      <div
+                        key={s.label}
+                        className="rounded-lg border border-surface-border bg-muted/20 py-3"
+                      >
+                        <div className="font-mono text-2xl font-bold">{s.value}</div>
+                        <div className="text-xs text-muted-foreground">{s.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {outcome.images_skipped > 0 && (
+                    <p className="text-center text-xs text-amber-400">
+                      {outcome.images_skipped} image(s) had no detectable face or body
+                    </p>
+                  )}
                 </div>
-                <div className="space-y-1.5">
-                  <Label>Name</Label>
-                  <Input
-                    placeholder="Full Name"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                  />
+              ) : (
+                /* ── Form state ────────────────────────────────── */
+                <div className="space-y-4">
+                  <div className="space-y-1.5">
+                    <Label>Name</Label>
+                    <Input
+                      id="watchlist-name"
+                      placeholder="Full Name"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label>Photos</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Add one or more face photos. More images improve matching accuracy.
+                    </p>
+
+                    {images.length > 0 && (
+                      <div className="flex flex-wrap gap-2">
+                        <AnimatePresence>
+                          {images.map((img, i) => (
+                            <motion.div
+                              key={img.name + i}
+                              initial={{ opacity: 0, scale: 0.8 }}
+                              animate={{ opacity: 1, scale: 1 }}
+                              exit={{ opacity: 0, scale: 0.8 }}
+                              className="relative"
+                            >
+                              <img
+                                src={URL.createObjectURL(img)}
+                                alt={img.name}
+                                className="h-16 w-16 rounded-md object-cover ring-1 ring-surface-border"
+                              />
+                              <button
+                                onClick={() => removeImage(i)}
+                                className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-status-alert text-white shadow"
+                              >
+                                <X className="h-3 w-3" />
+                              </button>
+                            </motion.div>
+                          ))}
+                        </AnimatePresence>
+                      </div>
+                    )}
+
+                    <button
+                      id="watchlist-add-images-btn"
+                      onClick={() => fileRef.current?.click()}
+                      className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-surface-border py-4 text-sm text-muted-foreground transition-colors hover:border-brand hover:text-brand"
+                    >
+                      <ImagePlus className="h-4 w-4" />
+                      {images.length === 0 ? "Add photos" : "Add more photos"}
+                    </button>
+                    <input
+                      ref={fileRef}
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      className="hidden"
+                      onChange={(e) => addImages(e.target.files)}
+                    />
+                  </div>
+
+                  {/* Night augment toggle */}
+                  <div className="flex items-center gap-3">
+                    <input
+                      id="watchlist-night-augment"
+                      type="checkbox"
+                      checked={nightAugment}
+                      onChange={(e) => setNightAugment(e.target.checked)}
+                      className="h-4 w-4 rounded border-surface-border accent-brand"
+                    />
+                    <Label htmlFor="watchlist-night-augment" className="cursor-pointer">
+                      Night augmentation
+                      <span className="ml-1 text-xs text-muted-foreground">
+                        (improves low-light matching)
+                      </span>
+                    </Label>
+                  </div>
                 </div>
-                <div className="space-y-1.5">
-                  <Label>Photo</Label>
-                  <ImageUploader onFile={setPhoto} label="Drop a face photo" />
-                </div>
-              </div>
+              )}
+
               <DialogFooter>
-                <Button variant="ghost" onClick={() => setOpen(false)}>
-                  Cancel
+                <Button
+                  variant="ghost"
+                  onClick={() => { setOpen(false); reset(); }}
+                >
+                  {outcome ? "Close" : "Cancel"}
                 </Button>
-                <Button onClick={add} disabled={saving}>
-                  {saving ? "Adding…" : "Add →"}
-                </Button>
+                {!outcome && (
+                  <Button
+                    id="watchlist-submit-btn"
+                    onClick={add}
+                    disabled={saving}
+                  >
+                    {saving ? "Adding…" : "Add →"}
+                  </Button>
+                )}
+                {outcome && (
+                  <Button onClick={reset} variant="outline">
+                    Add Another
+                  </Button>
+                )}
               </DialogFooter>
             </DialogContent>
           </Dialog>

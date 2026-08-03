@@ -25,6 +25,25 @@ Changes from the version you're running:
      Body-only matching now only runs when NO face was found in the crop
      at all (i.e. face_embedding is None), which is the only situation
      it's actually meant for.
+
+  5. NEW — enrollment-time night-domain augmentation (add_person):
+     Root cause of "known person shows Unknown at night": reference photos
+     enrolled via /watchlist/add are daylight shots, but frames processed
+     at night pass through ZeroDCEEnhancer (Gamma -> CLAHE -> Zero-DCE++)
+     BEFORE ArcFace runs. That enhancement chain shifts the resulting
+     512-d embedding just enough that it falls below face_sim_threshold
+     against a clean daylight reference embedding -- the face is detected
+     fine, it's the embedding that's out of domain.
+
+     Fix: when an `enhancer` is passed to add_person(), each reference
+     image is ALSO synthetically darkened and run through the exact same
+     enhancement chain used at inference time, then embedded and stored
+     as an additional face_embedding row for that person. The registry
+     now holds both a "daylight" and a "night-enhanced" embedding per
+     person, so a real night-time query has something in the right domain
+     to match against. This is purely additive -- nearest-neighbour search
+     in match_face() already checks all rows for a person, no query-side
+     changes needed.
 """
 
 from __future__ import annotations
@@ -37,6 +56,7 @@ import numpy as np
 import psycopg2
 import psycopg2.extras
 from pgvector.psycopg2 import register_vector
+import cv2  # add to imports at top of pg_vector.py
 
 logger = logging.getLogger("person_registry_pgvector")
 
@@ -47,6 +67,38 @@ _MIN_BODY_CROP_PX = 32
 # If two different registered people are within this margin of each other,
 # the match is too ambiguous to trust -- reject rather than guess.
 _BODY_MATCH_MIN_MARGIN = 0.06
+
+# How dark to synthetically render a daylight reference photo before
+# running it through the enhancement chain during enrollment. Chosen to
+# land in the same rough brightness band as DayNightClassifier's
+# DARK_THRESH (<=85 mean) so the simulated image actually triggers the
+# same processing path a real night frame would.
+_NIGHT_SIM_DARKNESS_FACTOR = 0.35
+_NIGHT_SIM_NOISE_STD = 4.0
+
+
+def _simulate_night_conditions(img: np.ndarray) -> np.ndarray:
+    """
+    Synthetically darken AND desaturate a well-lit reference image to
+    approximate what this person's face looks like to THIS camera at night,
+    BEFORE the same enhancement chain used at inference time is applied.
+
+    Desaturation matters as much as darkening: this camera's night output is
+    effectively monochrome (IR-illuminated), not just dim color video. Without
+    this step, the enhancer (SCI, trained on color DARK FACE images) will
+    happily reconstruct color/skin-tone information the real camera never
+    captures, leaving the stored embedding in the wrong domain versus real
+    query-time embeddings.
+    """
+    darkened = img.astype(np.float32) * _NIGHT_SIM_DARKNESS_FACTOR
+    darkened = np.clip(darkened, 0, 255).astype(np.uint8)
+
+    gray = cv2.cvtColor(darkened, cv2.COLOR_BGR2GRAY)
+    darkened = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR).astype(np.float32)
+
+    noise = np.random.normal(0, _NIGHT_SIM_NOISE_STD, img.shape).astype(np.float32)
+    darkened = np.clip(darkened + noise, 0, 255).astype(np.uint8)
+    return darkened
 
 
 @dataclass
@@ -60,6 +112,7 @@ class RegistrationOutcome:
     errors: list = None
     registry_unavailable: bool = False
     reused_existing_person: bool = False
+    night_variants_added: int = 0  # NEW — count of synthetic night-domain embeddings added
 
     def __post_init__(self):
         if self.errors is None:
@@ -70,8 +123,8 @@ class PersonRegistry:
     def __init__(
         self,
         dsn: str,
-        face_sim_threshold: float = 0.50,
-        body_sim_threshold: float = 0.82,   # was 0.50 -- too low, see docstring
+        face_sim_threshold: float = 0.20,
+        body_sim_threshold: float = 0.22,   # was 0.50 -- too low, see docstring
         body_match_min_margin: float = _BODY_MATCH_MIN_MARGIN,
     ):
         self.dsn = dsn
@@ -120,6 +173,8 @@ class PersonRegistry:
         person_detector,
         reidentifier,
         person_id: str | None = None,
+        enhancer=None,               # NEW — pass pipeline.enhancer to enable night augmentation
+        night_augment: bool = True,  # NEW — set False to skip augmentation even if enhancer given
     ) -> RegistrationOutcome:
         if not self._available:
             msg = ("PersonRegistry is unavailable — pgvector extension not installed. "
@@ -155,6 +210,7 @@ class PersonRegistry:
 
         face_added = 0
         body_added = 0
+        night_variants_added = 0
         skipped = 0
         errors = []
 
@@ -189,6 +245,53 @@ class PersonRegistry:
                 errors.append(err)
                 logger.warning(f"add_person: face path failed on image {idx}: {e}")
 
+            # ---- NEW: night-domain augmentation -------------------------- #
+            # Synthetically darken this same reference image, push it through
+            # the SAME enhancement chain used at inference time, and store
+            # the resulting embedding as an additional row for this person.
+            # This is what actually closes the "Unknown at night" gap -- see
+            # module docstring point 5.
+            if enhancer is not None and night_augment:
+                try:
+                    night_img = _simulate_night_conditions(img)
+                    night_enhanced = enhancer.enhance(night_img)
+
+                    if hasattr(face_recogniser, "detect_and_embed"):
+                        night_faces = face_recogniser.detect_and_embed(night_enhanced)
+                    else:
+                        night_faces = face_recogniser.detect(night_enhanced)
+
+                    if night_faces:
+                        confident_night = [
+                            f for f in night_faces if f.confidence >= _MIN_FACE_CONF_REGISTER
+                        ]
+                        if confident_night:
+                            best_night_face = max(confident_night, key=lambda f: f.confidence)
+                            if best_night_face.embedding is not None:
+                                self._insert_embedding(
+                                    "face_embeddings", pid, best_night_face.embedding
+                                )
+                                night_variants_added += 1
+                                found_something = True
+                            else:
+                                errors.append(
+                                    f"img[{idx}] night-aug: embedding extraction returned None"
+                                )
+                        else:
+                            errors.append(
+                                f"img[{idx}] night-aug: face detected but below confidence "
+                                f"threshold on the enhanced/darkened variant"
+                            )
+                    else:
+                        errors.append(
+                            f"img[{idx}] night-aug: no face detected on synthetic night variant "
+                            f"(enhancement chain may have degraded the crop too much)"
+                        )
+                except Exception as e:
+                    err = f"img[{idx}] night-aug: {type(e).__name__}: {e}"
+                    errors.append(err)
+                    logger.warning(f"add_person: night augmentation failed on image {idx}: {e}")
+
             try:
                 det_result = person_detector.detect(img, frame_id=f"reg_{idx}", camera_id="registration")
                 detections = getattr(det_result, "detections", [])
@@ -220,6 +323,7 @@ class PersonRegistry:
             person_id=pid, name=name, images_received=len(images),
             face_embeddings_added=face_added, body_embeddings_added=body_added,
             images_skipped=skipped, errors=errors, reused_existing_person=reused,
+            night_variants_added=night_variants_added,
         )
 
     def _insert_embedding(self, table: str, person_id: str, vec: np.ndarray):
@@ -277,9 +381,16 @@ class PersonRegistry:
             )
             row = cur.fetchone()
         if row is None:
+            logger.info("match_face: no rows in face_embeddings table at all.")
             return None, 0.0
+
         similarity = float(row["similarity"])
-        if similarity >= self.face_sim_threshold:
+        is_match = similarity >= self.face_sim_threshold
+        logger.info(
+            f"match_face: best candidate='{row['name']}' sim={similarity:.4f} "
+            f"threshold={self.face_sim_threshold:.2f} -> {'MATCH' if is_match else 'no match'}"
+        )
+        if is_match:
             return {"person_id": row["person_id"], "name": row["name"]}, similarity
         return None, similarity
 

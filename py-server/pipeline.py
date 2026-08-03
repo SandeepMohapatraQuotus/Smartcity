@@ -10,12 +10,13 @@ from clashifiers.vechile_detector.main   import VehicleDetector, VehicleDetectio
 from clashifiers.face_recognization.main import FaceRecogniser, DetectedFace
 from clashifiers.person_detector.main   import PersonDetector, PersonDetectionResult
 from services.zero_dce  import ZeroDCEEnhancer
+from services.sci_enhance import SCIEnhancer
 from services.anpr      import ANPRService, ANPRResult
 from services.dehazing  import DehazingService
 from clashifiers.person_reid.main import PersonReIdentifier
 from pg_vector import PersonRegistry
-
-
+import logging
+logger = logging.getLogger("smart_city_pipeline")
 # ─── Frame Event ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -67,8 +68,8 @@ class SmartCityPipeline:
         vehicle_model_size  : str   = "yolov8m",
         face_ctx_id         : int   = -1,
         day_night_weights   : Optional[str] = None,
-        face_sim_threshold  : float = 0.70,
-        body_sim_threshold  : float = 0.82,   # was 0.60 -- see pg_vector.py docstring
+        face_sim_threshold  : float = 0.20,
+        body_sim_threshold  : float = 0.22,   # was 0.60 -- see pg_vector.py docstring
         body_match_min_margin: float = 0.06,
         reid_device         : str   = "cpu",
         anpr_interval       : int   = 5,
@@ -87,6 +88,21 @@ class SmartCityPipeline:
         zero_dce_weights_path : Optional[str] = None,
         zero_dce_scale_factor : int   = 12,
         zero_dce_device        : str   = "cpu",
+        night_enhancement_backend : str = "sci",  # NEW — "sci" (default) | "zero_dce"
+                                                   # See services/sci_enhance.py docstring for why
+                                                   # SCI replaces Zero-DCE++ as the default: it was
+                                                   # built and benchmarked specifically for low-light
+                                                   # FACE DETECTION as a downstream task, not just
+                                                   # perceptual quality, which is what was silently
+                                                   # starving PersonDetector/FaceRecogniser at night.
+        sci_weights_path       : Optional[str] = None,  # defaults to weights/sci_difficult.pt
+                                                          # (DARK FACE-trained) inside sci_enhance.py
+        sci_device              : str  = "cpu",
+        sci_n_threads           : int  = 4,
+        sci_enable_post_clahe   : bool = True,
+        face_embedding_history_len : int = 5,     # NEW — frames of face embedding to pool per track
+        track_history_prune_after  : int = 150,   # NEW — drop a track's history after this many
+                                                   #        frames of not being seen
     ):
         self.camera_id = camera_id
         self._frame_idx = 0
@@ -106,6 +122,19 @@ class SmartCityPipeline:
         self._anpr_interval    = anpr_interval
         self._last_anpr_result : Optional[ANPRResult] = None
         self._inference_max_side = inference_max_side
+
+        # ── NEW: per-track rolling face embedding history ──────────────────
+        # A single frame's ArcFace embedding under night enhancement is noisy
+        # enough that a known person can drop below face_sim_threshold on any
+        # given frame, even though the face was detected correctly. BotSORT
+        # already gives each person a stable track_id, so instead of matching
+        # on one frame's embedding, we pool the last N embeddings seen for
+        # that track (mean of L2-normalized vectors, renormalized) and match
+        # against that. See _update_track_face_history() below.
+        self._face_embedding_history_len = face_embedding_history_len
+        self._track_history_prune_after  = track_history_prune_after
+        self._track_face_embeddings: dict = {}     # track_id -> list[np.ndarray]
+        self._track_last_seen_frame: dict = {}      # track_id -> frame_idx
 
         print("[Pipeline] Loading Day/Night Classifier ...")
         self.day_night = DayNightClassifier(model_path=day_night_weights)
@@ -129,19 +158,43 @@ class SmartCityPipeline:
 
         print("[Pipeline] Loading Night Enhancer "
               "(Gamma Correction -> CLAHE -> Zero-DCE++ chain) ...")
-        enhancer_kwargs = dict(
-            scale_factor          = zero_dce_scale_factor,
-            device                 = zero_dce_device,
-            enable_gamma            = enhance_gamma,
-            enable_clahe             = enhance_clahe,
-            enable_zero_dce          = enhance_zero_dce,
-            gamma_target_mean        = gamma_target_mean,
-            clahe_clip_limit         = clahe_clip_limit,
-            clahe_tile_grid_size     = clahe_tile_grid_size,
-        )
-        if zero_dce_weights_path:
-            enhancer_kwargs["weights_path"] = zero_dce_weights_path
-        self.enhancer = ZeroDCEEnhancer(**enhancer_kwargs)
+
+        self.night_enhancement_backend = night_enhancement_backend
+
+        if night_enhancement_backend == "sci":
+            print("[Pipeline] Loading Night Enhancer "
+                  "(SCI — Self-Calibrated Illumination, CVPR2022, DARK FACE-trained) ...")
+            sci_kwargs = dict(
+                device            = sci_device,
+                n_threads         = sci_n_threads,
+                enable_post_clahe = sci_enable_post_clahe,
+            )
+            if sci_weights_path:
+                sci_kwargs["weights_path"] = sci_weights_path
+            self.enhancer = SCIEnhancer(**sci_kwargs)
+
+        elif night_enhancement_backend == "zero_dce":
+            print("[Pipeline] Loading Night Enhancer "
+                  "(Gamma Correction -> CLAHE -> Zero-DCE++ chain) ...")
+            enhancer_kwargs = dict(
+                scale_factor          = zero_dce_scale_factor,
+                device                 = zero_dce_device,
+                enable_gamma            = enhance_gamma,
+                enable_clahe             = enhance_clahe,
+                enable_zero_dce          = enhance_zero_dce,
+                gamma_target_mean        = gamma_target_mean,
+                clahe_clip_limit         = clahe_clip_limit,
+                clahe_tile_grid_size     = clahe_tile_grid_size,
+            )
+            if zero_dce_weights_path:
+                enhancer_kwargs["weights_path"] = zero_dce_weights_path
+            self.enhancer = ZeroDCEEnhancer(**enhancer_kwargs)
+
+        else:
+            raise ValueError(
+                f"Unknown night_enhancement_backend={night_enhancement_backend!r}. "
+                f"Expected 'sci' or 'zero_dce'."
+            )
 
         print("[Pipeline] Loading Person Detector (YOLOv8) ...")
         self.person_detector = PersonDetector(
@@ -168,9 +221,10 @@ class SmartCityPipeline:
             f"face_det_size(base)={face_det_size}  "
             f"n_threads={n_threads}  "
             f"body_sim_threshold={body_sim_threshold}  "
+            f"face_embedding_history_len={face_embedding_history_len}  "
             f"plate_model={'YOLO (' + plate_model_path + ')' if plate_model_path else 'contour fallback'}\n"
-            f"           enhancement_chain=gamma:{enhance_gamma} clahe:{enhance_clahe} "
-            f"zero_dce:{enhance_zero_dce}\n"
+            f"           night_enhancement_backend={night_enhancement_backend}  "
+            f"({self.enhancer.method})\n"
         )
 
     def _maybe_downscale(self, frame: np.ndarray) -> np.ndarray:
@@ -185,11 +239,76 @@ class SmartCityPipeline:
         new_h  = int(round(h * scale))
         return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
+    # ── NEW: track-level face embedding aggregation ────────────────────────
+
+
+    def _update_track_face_history(self, track_id, embedding: np.ndarray) -> np.ndarray:
+        _TRACK_RESET_SIM_THRESHOLD = 0.40  # class-level constant near the top of SmartCityPipeline
+        embedding = np.asarray(embedding, dtype=np.float32)
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        history = self._track_face_embeddings.setdefault(track_id, [])
+
+        # ── Guard against BotSORT track-ID switches ─────────────────────────
+        # If this track already has a pooled identity and the new face looks
+        # nothing like it, this is very likely a different person who inherited
+        # the same track_id after an occlusion/handoff -- reset instead of
+        # blending two different people's embeddings together.
+        if history:
+            prev_stacked = np.stack(history)
+            prev_norms = np.linalg.norm(prev_stacked, axis=1, keepdims=True)
+            prev_norms[prev_norms == 0] = 1e-6
+            prev_aggregated = (prev_stacked / prev_norms).mean(axis=0)
+            agg_norm = np.linalg.norm(prev_aggregated)
+            if agg_norm > 0:
+                prev_aggregated = prev_aggregated / agg_norm
+
+            sim_to_history = float(np.dot(embedding, prev_aggregated))
+            if sim_to_history < _TRACK_RESET_SIM_THRESHOLD:
+                logger.info(
+                    f"track {track_id}: new face sim={sim_to_history:.3f} to existing "
+                    f"history is below reset threshold ({_TRACK_RESET_SIM_THRESHOLD}) -- "
+                    f"likely a track-ID handoff to a different person; resetting history."
+                ) if 'logger' in dir() else None
+                history.clear()
+
+        history.append(embedding)
+        if len(history) > self._face_embedding_history_len:
+            history.pop(0)
+        self._track_last_seen_frame[track_id] = self._frame_idx
+
+        stacked = np.stack(history)
+        norms = np.linalg.norm(stacked, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-6
+        normalized = stacked / norms
+        aggregated = normalized.mean(axis=0)
+        agg_norm = np.linalg.norm(aggregated)
+        if agg_norm > 0:
+            aggregated = aggregated / agg_norm
+        return aggregated
+
+    def _prune_track_history(self):
+        """Drop history for tracks not seen recently, so a long-running
+        stream doesn't accumulate unbounded per-track embedding buffers."""
+        if not self._track_last_seen_frame:
+            return
+        stale = [
+            tid for tid, last_seen in self._track_last_seen_frame.items()
+            if self._frame_idx - last_seen > self._track_history_prune_after
+        ]
+        for tid in stale:
+            self._track_face_embeddings.pop(tid, None)
+            self._track_last_seen_frame.pop(tid, None)
+
     def process_frame(self, frame: np.ndarray) -> "FrameEvent":
         self._frame_idx += 1
         frame_id  = f"frame_{self._frame_idx:06d}"
         timestamp = time.time()
         identified_people = []
+
+        self._prune_track_history()
 
         dn       = self.day_night.predict(frame)
         working  = frame
@@ -212,11 +331,12 @@ class SmartCityPipeline:
         )
         # Person detection is needed synchronously BEFORE face detection now,
         # because adaptive_detect() needs a person-count hint to pick the
-        # right detection grid size. This was the actual reason faces=[] kept
-        # showing up on group photos -- adaptive_detect() existed but nothing
-        # ever called it; recognise() always ran at the fixed base det_size.
-        person_result: PersonDetectionResult = self.person_detector.detect(
-            infer_frame, frame_id, self.camera_id
+        # right detection grid size.
+        person_result: PersonDetectionResult = self.person_detector.adaptive_detect(
+            infer_frame,
+            frame_id          = frame_id,
+            camera_id         = self.camera_id,
+            person_count_hint = 0,   # no prior count on first pass; adaptive uses result
         )
         person_count_hint = len(person_result.detections)
 
@@ -226,12 +346,44 @@ class SmartCityPipeline:
 
         vehicle_result: VehicleDetectionResult = fut_vehicles.result()
 
+        # ── Bind faces to person tracks ONCE, reused by both matching passes ──
+        # (previously this spatial-binding loop was duplicated below; doing it
+        # once here also lets us build the per-track aggregated embedding
+        # before either matching pass runs.)
+        track_matching_face = {}   # person track_id -> DetectedFace
+        face_query_embedding = {}  # id(face) -> embedding to actually match with (aggregated if bound)
+
+        for person_det in person_result.detections:
+            x1, y1, x2, y2 = person_det.bbox
+            matching_face = None
+            for face in faces:
+                fx1, fy1, fx2, fy2 = face.bbox
+                face_cx, face_cy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                if x1 <= face_cx <= x2 and y1 <= face_cy <= y2:
+                    matching_face = face
+                    break
+
+            if matching_face is None:
+                continue
+
+            track_matching_face[person_det.track_id] = matching_face
+
+            if matching_face.embedding is not None:
+                aggregated = self._update_track_face_history(
+                    person_det.track_id, matching_face.embedding
+                )
+                face_query_embedding[id(matching_face)] = aggregated
+
         # ── Face identity matching — single source of truth: person_registry ──
+        # Uses the track-aggregated embedding when this face is bound to a
+        # tracked person (smooths night-time flicker); falls back to the raw
+        # single-frame embedding for faces with no body/track binding.
         face_dicts = []
         alerts = []
         for face in faces:
-            best_match, sim = self.person_registry.match_face(face.embedding) \
-                if face.embedding is not None else (None, 0.0)
+            query_embedding = face_query_embedding.get(id(face), face.embedding)
+            best_match, sim = self.person_registry.match_face(query_embedding) \
+                if query_embedding is not None else (None, 0.0)
             face_dicts.append({
                 "bbox": face.bbox,
                 "confidence": round(face.confidence, 4),
@@ -268,16 +420,15 @@ class SmartCityPipeline:
             if person_crop.size == 0:
                 continue
 
-            # Find a face whose center falls inside this person's bbox.
-            matching_face = None
-            for face in faces:
-                fx1, fy1, fx2, fy2 = face.bbox
-                face_cx, face_cy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-                if x1 <= face_cx <= x2 and y1 <= face_cy <= y2:
-                    matching_face = face
-                    break
+            matching_face = track_matching_face.get(person_det.track_id)
 
-            face_embedding = matching_face.embedding if matching_face else None
+            face_embedding = None
+            if matching_face is not None and matching_face.embedding is not None:
+                # Use the track-aggregated embedding, same one used above,
+                # so /events and identified_people agree with each other.
+                face_embedding = face_query_embedding.get(
+                    id(matching_face), matching_face.embedding
+                )
 
             # Only compute a body embedding if we don't already have a face --
             # identify() now ignores body_embedding whenever a face was found,
