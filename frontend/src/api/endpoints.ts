@@ -108,11 +108,16 @@ export const addPersonToWatchlist = ({
   files,
   personId = null,
   nightAugment = true,
+  imageUrl = null,
+  imageUrls = null,
 }: {
   name: string;
   files: File[];
   personId?: string | null;
   nightAugment?: boolean;
+  imageUrl?: string | null;
+  /** All reference photo URLs in order (0 = primary display photo). Sent as JSON string. */
+  imageUrls?: string[] | null;
 }) => {
   if (!name.trim()) throw new Error("name is required");
   if (!files.length) throw new Error("at least one file is required");
@@ -126,6 +131,13 @@ export const addPersonToWatchlist = ({
   for (const file of files) fd.append("files", file);
 
   if (personId) fd.append("person_id", personId);
+  if (imageUrl) fd.append("image_url", imageUrl);
+
+  // Send all photo URLs as a JSON-encoded list so the backend can store each
+  // one in person_images at the correct position.
+  if (imageUrls && imageUrls.length > 0) {
+    fd.append("image_urls", JSON.stringify(imageUrls));
+  }
 
   // FastAPI bool coercion handles the "true"/"false" strings correctly.
   fd.append("night_augment", nightAugment ? "true" : "false");
@@ -157,7 +169,9 @@ export const addRegistryPerson = (
   images: File[],
   personId?: string | null,
   nightAugment = true,
-) => addPersonToWatchlist({ name, files: images, personId, nightAugment });
+  imageUrl?: string | null,
+  imageUrls?: string[] | null,
+) => addPersonToWatchlist({ name, files: images, personId, nightAugment, imageUrl, imageUrls });
 
 export const removeRegistryPerson = (person_id: string) =>
   api.delete(`/watchlist/${person_id}`).then((r) => r.data);

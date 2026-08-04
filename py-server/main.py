@@ -618,16 +618,14 @@ async def stream_single_frame():
     )
 
 
-
-
-
-
 # ─── Watchlist ────────────────────────────────────────────────────────────────
 
 @app.post("/watchlist/add", tags=["Watchlist"])
 async def watchlist_add(
     name          : str                 = Form(..., description="Display name  e.g. 'Sandeep'"),
     person_id     : Optional[str]       = Form(None, description="Existing person_id to add more photos to (optional)"),
+    image_url     : Optional[str]       = Form(None, description="Primary display URL (position 0). If omitted, first entry of image_urls is used."),
+    image_urls    : Optional[str]       = Form(None, description="JSON-encoded list of ALL reference photo URLs in order. position=0 is the display photo."),
     files         : List[UploadFile]    = File(..., description="One or more reference face / body photos (JPEG / PNG)"),
     night_augment : bool                = Form(True, description=(
         "If true (default), also synthesise a night-domain variant of each "
@@ -643,7 +641,7 @@ async def watchlist_add(
 
     Accepts **multiple reference photos in a single call** — this is important:
     if the frontend uploads N photos by calling this endpoint N times (one
-    photo each), and doesn’t carry the returned `person_id` across calls, each
+    photo each), and doesn't carry the returned `person_id` across calls, each
     call previously minted a fresh UUID, producing N duplicate personas.
 
     Fix: upload all photos in **one** multipart call.  Or, on subsequent calls,
@@ -657,7 +655,27 @@ async def watchlist_add(
     synthesise a night-domain embedding (see `night_augment` above) so this
     person can still be matched once real night frames get routed through
     the pipeline's low-light enhancement chain before ArcFace runs.
+
+    Multiple display photos: pass `image_urls` as a JSON-encoded list of
+    Cloudinary (or any public) URLs — one per uploaded photo, in upload order.
+    position=0 is the primary display photo shown in alerts and registry cards.
+    Additional URLs are stored in `person_images` and returned in `GET /watchlist`.
     """
+    import json as _json
+
+    # Parse the JSON-encoded list of all image URLs
+    parsed_image_urls: list[str] | None = None
+    if image_urls:
+        try:
+            parsed_image_urls = _json.loads(image_urls)
+            if not isinstance(parsed_image_urls, list):
+                parsed_image_urls = None
+        except Exception:
+            parsed_image_urls = None
+
+    # Derive primary URL: explicit image_url wins, else first of parsed list
+    primary_url = image_url or (parsed_image_urls[0] if parsed_image_urls else None)
+
     decoded_images: list[np.ndarray] = []
     for upload in files:
         raw = await upload.read()
@@ -684,6 +702,8 @@ async def watchlist_add(
         person_id=person_id,
         enhancer=pipeline.enhancer,
         night_augment=night_augment,
+        image_url=primary_url,
+        image_urls=parsed_image_urls,
     )
 
     if outcome.registry_unavailable:
@@ -702,6 +722,8 @@ async def watchlist_add(
     return {
         "person_id":              outcome.person_id,
         "name":                   outcome.name,
+        "image_url":              primary_url,
+        "image_urls":             parsed_image_urls or ([primary_url] if primary_url else []),
         "images_received":        outcome.images_received,
         "face_embeddings_added":  outcome.face_embeddings_added,
         "night_variants_added":   outcome.night_variants_added,

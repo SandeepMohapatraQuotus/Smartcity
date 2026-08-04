@@ -189,14 +189,35 @@ function Dashboard() {
               <AnimatePresence initial={false}>
                 {alerts.slice(0, 6).map((a) => (
                   <motion.div
-                    key={a.person_id + a.frame_id}
+                    key={a.person_id}
                     initial={{ opacity: 0, y: -10, scale: 0.96 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     exit={{ opacity: 0, y: -10, scale: 0.96 }}
                     className="glow-alert rounded-lg border border-status-alert/40 bg-status-alert/5 p-3"
                   >
-                    <div className="flex items-center gap-2 text-sm font-semibold text-status-alert">
-                      <Siren className="h-4 w-4" /> {a.name}
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        {/* Person photo or icon */}
+                        {a.image_url ? (
+                          <img
+                            src={a.image_url}
+                            alt={a.name}
+                            className="h-8 w-8 shrink-0 rounded-full object-cover ring-1 ring-status-alert/50"
+                          />
+                        ) : (
+                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-status-alert/20">
+                            <Siren className="h-4 w-4 text-status-alert" />
+                          </div>
+                        )}
+                        <span className="truncate text-sm font-semibold text-status-alert">
+                          {a.name}
+                        </span>
+                      </div>
+                      {a.hits > 1 && (
+                        <span className="shrink-0 rounded-full bg-status-alert/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-status-alert">
+                          ×{a.hits}
+                        </span>
+                      )}
                     </div>
                     <div className="mt-1 font-mono text-xs text-muted-foreground">
                       sim {Math.round(a.similarity * 100)}% · {a.frame_id} ·{" "}

@@ -1,11 +1,20 @@
 /**
  * useAlertStream — backed by WebSocket.
- * Tracks newly-seen alert keys exactly like the old polling version so
- * newCount increments are preserved.
+ *
+ * The server pushes the FULL cumulative alert buffer on every WebSocket tick,
+ * not just the delta. This means on tick N we receive all alerts from frames
+ * 1..N. We must track which (person_id, frame_id) pairs we've already counted
+ * so each unique detection is only counted ONCE regardless of how many ticks
+ * arrive.
+ *
+ * Result: one DeduplicatedAlert card per person_id, with:
+ *   - hits     = number of distinct frames the person was seen in
+ *   - frame_id = most recent frame
+ *   - first_frame_id = first frame this session
  */
 import { useEffect, useRef, useState } from "react";
 import { useWebSocket } from "./useWebSocket";
-import type { AlertEvent } from "@/api/types";
+import type { AlertEvent, DeduplicatedAlert } from "@/api/types";
 
 interface Options {
   enabled: boolean;
@@ -14,40 +23,71 @@ interface Options {
   interval?: number;
 }
 
-const keyOf = (a: AlertEvent) => `${a.person_id}::${a.frame_id}`;
-
 export function useAlertStream({ enabled }: Options) {
   const { alerts: wsAlerts } = useWebSocket(enabled);
-  const [alerts, setAlerts] = useState<AlertEvent[]>([]);
+
+  // person_id → DeduplicatedAlert
+  const alertMap = useRef<Map<string, DeduplicatedAlert>>(new Map());
+  // "person_id::frame_id" keys we have already counted — prevents double-
+  // counting when the server re-sends the same buffer on the next tick.
+  const countedKeys = useRef<Set<string>>(new Set());
+
+  const [alerts, setAlerts] = useState<DeduplicatedAlert[]>([]);
   const [newCount, setNewCount] = useState(0);
-  const seen = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (!enabled || !wsAlerts.length) return;
 
-    const deduped: AlertEvent[] = [];
-    const keys = new Set<string>();
+    let freshPersons = 0;
+
     for (const a of wsAlerts) {
-      const k = keyOf(a);
-      if (keys.has(k)) continue;
-      keys.add(k);
-      deduped.push(a);
+      const countKey = `${a.person_id}::${a.frame_id}`;
+
+      // Skip if we already counted this exact (person, frame) pair.
+      if (countedKeys.current.has(countKey)) continue;
+      countedKeys.current.add(countKey);
+
+      const existing = alertMap.current.get(a.person_id);
+      if (existing) {
+        // Same person, new frame — just update metadata and bump hits.
+        existing.hits++;
+        existing.frame_id  = a.frame_id;
+        existing.timestamp = a.timestamp;
+        if (a.similarity > existing.similarity) {
+          existing.similarity = a.similarity;
+        }
+      } else {
+        // First detection of this person this session.
+        alertMap.current.set(a.person_id, {
+          ...a,
+          hits:           1,
+          first_frame_id: a.frame_id,
+        });
+        freshPersons++;
+      }
     }
 
-    let fresh = 0;
-    for (const k of keys) if (!seen.current.has(k)) fresh++;
-    seen.current = keys;
+    if (freshPersons === 0 && !wsAlerts.some(
+      (a) => !countedKeys.current.has(`${a.person_id}::${a.frame_id}`)
+    )) {
+      // Nothing new — skip re-render.
+      return;
+    }
 
-    setAlerts(deduped);
-    if (fresh > 0) setNewCount((c) => c + fresh);
+    const sorted = [...alertMap.current.values()].sort(
+      (a, b) => b.timestamp - a.timestamp,
+    );
+    setAlerts(sorted);
+    if (freshPersons > 0) setNewCount((c) => c + freshPersons);
   }, [wsAlerts, enabled]);
 
-  // Reset on disable
+  // Reset everything when stream is disabled.
   useEffect(() => {
     if (!enabled) {
+      alertMap.current.clear();
+      countedKeys.current.clear();
       setAlerts([]);
       setNewCount(0);
-      seen.current = new Set();
     }
   }, [enabled]);
 

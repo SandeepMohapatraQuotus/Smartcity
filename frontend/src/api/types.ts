@@ -77,12 +77,21 @@ export interface AlertEvent {
   type: "face_watchlist_hit" | "person_registry_hit";
   person_id: string;
   name: string;
+  image_url?: string | null;
   similarity: number;
   frame_id: string;
   camera_id: string;
   timestamp: number;
   method?: "face" | "body";
   track_id?: number;
+}
+
+/** Frontend-only: one entry per person_id, collapsing repeated detections. */
+export interface DeduplicatedAlert extends AlertEvent {
+  /** Total number of frames this person was detected in. */
+  hits: number;
+  /** frame_id of the first detection in this session. */
+  first_frame_id: string;
 }
 
 export interface FrameEvent {
@@ -127,6 +136,9 @@ export interface IdentifyResult {
 export interface WatchlistPerson {
   person_id: string;
   name: string;
+  image_url?: string | null;
+  face_refs?: number;
+  body_refs?: number;
 }
 
 export interface StreamStatus {
@@ -148,6 +160,9 @@ export interface ServerStatus {
 export interface RegistryPerson {
   person_id: string;
   name: string;
+  image_url?: string | null;
+  /** All reference photo URLs, ordered by position (0 = primary display photo). */
+  image_urls?: string[];
   face_refs: number;
   body_refs: number;
 }
@@ -155,6 +170,9 @@ export interface RegistryPerson {
 export interface AddPersonOutcome {
   person_id: string;
   name: string;
+  image_url?: string | null;
+  /** All reference photo URLs stored (ordered; [0] = primary display photo). */
+  image_urls?: string[];
   images_received: number;
   face_embeddings_added: number;
   body_embeddings_added: number;

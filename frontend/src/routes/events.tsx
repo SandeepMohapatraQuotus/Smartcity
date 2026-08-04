@@ -29,7 +29,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { getEvents, getAlerts, clearBuffers } from "@/api/endpoints";
-import type { FrameEvent, AlertEvent } from "@/api/types";
+import type { FrameEvent, AlertEvent, DeduplicatedAlert } from "@/api/types";
 import { formatTimestamp } from "@/lib/utils";
 
 export const Route = createFileRoute("/events")({
@@ -41,6 +41,27 @@ export const Route = createFileRoute("/events")({
   }),
   component: Events,
 });
+
+// ── Alert deduplication ────────────────────────────────────────────
+// Collapse the raw alert list (one entry per frame hit) into one entry
+// per unique person_id, tracking hit count and first/latest frames.
+function dedupeAlerts(raw: AlertEvent[]): DeduplicatedAlert[] {
+  const map = new Map<string, DeduplicatedAlert>();
+  for (const a of raw) {
+    const existing = map.get(a.person_id);
+    if (existing) {
+      existing.hits++;
+      // Keep the latest frame/timestamp.
+      existing.frame_id  = a.frame_id;
+      existing.timestamp = a.timestamp;
+      if (a.similarity > existing.similarity) existing.similarity = a.similarity;
+    } else {
+      map.set(a.person_id, { ...a, hits: 1, first_frame_id: a.frame_id });
+    }
+  }
+  // Sort by most-recently seen first.
+  return [...map.values()].sort((a, b) => b.timestamp - a.timestamp);
+}
 
 function ClearButton({ onCleared }: { onCleared: () => void }) {
   return (
@@ -185,11 +206,14 @@ function EventTab() {
 }
 
 function AlertTab() {
-  const [alerts, setAlerts] = useState<AlertEvent[]>([]);
+  const [alerts, setAlerts] = useState<DeduplicatedAlert[]>([]);
+  const [rawCount, setRawCount] = useState(0);
 
   const load = async () => {
     try {
-      setAlerts(await getAlerts(100));
+      const raw = await getAlerts(100);
+      setRawCount(raw.length);
+      setAlerts(dedupeAlerts(raw));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to load alerts");
     }
@@ -203,7 +227,10 @@ function AlertTab() {
     <div className="space-y-4">
       <div className="flex items-center gap-3">
         <span className="text-sm text-muted-foreground">
-          {alerts.length} alert{alerts.length === 1 ? "" : "s"}
+          {alerts.length} unique person{alerts.length === 1 ? "" : "s"}
+          {rawCount > alerts.length && (
+            <span className="ml-1 text-muted-foreground/60">({rawCount} total detections)</span>
+          )}
         </span>
         <div className="ml-auto flex gap-2">
           <Button variant="secondary" size="sm" onClick={load}>
@@ -218,17 +245,49 @@ function AlertTab() {
         ) : (
           alerts.map((a, i) => (
             <motion.div
-              key={a.person_id + a.frame_id + i}
+              key={a.person_id}
               initial={{ opacity: 0, y: -8 }}
-              animate={{ opacity: 1, y: 0 }}
+              animate={{ opacity: 1, y: 0, transition: { delay: i * 0.04 } }}
               className="glow-alert rounded-xl border border-status-alert/40 bg-status-alert/5 p-4"
             >
-              <div className="flex items-center gap-2 font-semibold text-status-alert">
-                <Siren className="h-4 w-4" /> {a.name} ({a.person_id})
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  {/* Person photo or icon */}
+                  {a.image_url ? (
+                    <img
+                      src={a.image_url}
+                      alt={a.name}
+                      className="h-10 w-10 rounded-full object-cover ring-2 ring-status-alert/40"
+                    />
+                  ) : (
+                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-status-alert/20">
+                      <Siren className="h-5 w-5 text-status-alert" />
+                    </div>
+                  )}
+                  <div>
+                    <div className="flex items-center gap-2 font-semibold text-status-alert">
+                      {a.name}
+                      <span className="font-mono text-xs text-muted-foreground">({a.person_id})</span>
+                    </div>
+                    <div className="font-mono text-xs text-muted-foreground">
+                      Best sim: {(a.similarity * 100).toFixed(1)}%
+                      {a.method && <span className="ml-1">via {a.method}</span>}
+                    </div>
+                  </div>
+                </div>
+                {/* Hit counter badge */}
+                {a.hits > 1 && (
+                  <span className="rounded-full bg-status-alert/20 px-2 py-0.5 font-mono text-xs font-bold text-status-alert">
+                    ×{a.hits} hits
+                  </span>
+                )}
               </div>
-              <div className="mt-1 font-mono text-xs text-muted-foreground">
-                Similarity: {(a.similarity * 100).toFixed(1)}% · {a.frame_id} ·{" "}
-                {a.camera_id} · {formatTimestamp(a.timestamp)}
+              <div className="mt-1.5 font-mono text-xs text-muted-foreground/60">
+                {a.hits > 1
+                  ? <>First: {a.first_frame_id} · Latest: {a.frame_id}</>
+                  : a.frame_id
+                }
+                {" · "}{a.camera_id} · {formatTimestamp(a.timestamp)}
               </div>
             </motion.div>
           ))

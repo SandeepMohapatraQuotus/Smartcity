@@ -173,8 +173,10 @@ class PersonRegistry:
         person_detector,
         reidentifier,
         person_id: str | None = None,
-        enhancer=None,               # NEW — pass pipeline.enhancer to enable night augmentation
-        night_augment: bool = True,  # NEW — set False to skip augmentation even if enhancer given
+        enhancer=None,               # pass pipeline.enhancer to enable night augmentation
+        night_augment: bool = True,  # set False to skip augmentation even if enhancer given
+        image_url: str | None = None,  # primary display URL (stored in persons.image_url)
+        image_urls: list | None = None,  # NEW — all reference photo URLs (stored in person_images)
     ) -> RegistrationOutcome:
         if not self._available:
             msg = ("PersonRegistry is unavailable — pgvector extension not installed. "
@@ -199,14 +201,53 @@ class PersonRegistry:
             else:
                 pid = str(uuid.uuid4())
 
+        # Derive the primary URL: prefer explicit image_url, fall back to first of image_urls
+        primary_url = image_url or (image_urls[0] if image_urls else None)
+
         with self._conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO persons (person_id, name) VALUES (%s, %s)
-                ON CONFLICT (person_id) DO UPDATE SET name = EXCLUDED.name
+                INSERT INTO persons (person_id, name, image_url) VALUES (%s, %s, %s)
+                ON CONFLICT (person_id) DO UPDATE
+                    SET name = EXCLUDED.name,
+                        image_url = COALESCE(EXCLUDED.image_url, persons.image_url)
                 """,
-                (pid, name),
+                (pid, name, primary_url),
             )
+
+        # Persist all reference photo URLs in person_images (position-ordered).
+        # Gracefully skipped when the migration SQL hasn't been run yet.
+        _urls_to_insert: list[tuple] = []
+        if image_urls:
+            _urls_to_insert = [(pid, url, pos) for pos, url in enumerate(image_urls) if url]
+        elif primary_url:
+            _urls_to_insert = [(pid, primary_url, 0)]
+
+        if _urls_to_insert:
+            try:
+                with self._conn.cursor() as cur:
+                    for pid_, url, pos in _urls_to_insert:
+                        cur.execute(
+                            """
+                            INSERT INTO person_images (person_id, image_url, position)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (person_id, image_url) DO UPDATE
+                                SET position = EXCLUDED.position
+                            """,
+                            (pid_, url, pos),
+                        )
+            except psycopg2.errors.UndefinedTable:
+                # person_images table doesn't exist yet — migration not yet applied.
+                # Roll back so the connection stays in a clean state and continue.
+                self._conn.rollback()
+                logger.warning(
+                    "add_person: 'person_images' table not found — "
+                    "run pgvector_setup.sql to enable multi-image storage. "
+                    "Skipping image URL persistence for this registration."
+                )
+            except Exception:
+                self._conn.rollback()
+                raise
 
         face_added = 0
         body_added = 0
@@ -345,19 +386,75 @@ class PersonRegistry:
     def list_people(self) -> list:
         if not self._available:
             return []
-        with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT p.person_id, p.name,
-                       COUNT(DISTINCT f.id) AS face_refs,
-                       COUNT(DISTINCT b.id) AS body_refs
-                FROM persons p
-                LEFT JOIN face_embeddings f ON f.person_id = p.person_id
-                LEFT JOIN body_embeddings b ON b.person_id = p.person_id
-                GROUP BY p.person_id, p.name
-                """
+
+        _FULL_QUERY = """
+            SELECT
+                p.person_id,
+                p.name,
+                p.image_url,
+                COUNT(DISTINCT f.id) AS face_refs,
+                COUNT(DISTINCT b.id) AS body_refs,
+                COALESCE(
+                    ARRAY_AGG(pi.image_url ORDER BY pi.position)
+                        FILTER (WHERE pi.image_url IS NOT NULL),
+                    ARRAY[]::TEXT[]
+                ) AS image_urls
+            FROM persons p
+            LEFT JOIN face_embeddings  f  ON f.person_id  = p.person_id
+            LEFT JOIN body_embeddings  b  ON b.person_id  = p.person_id
+            LEFT JOIN person_images    pi ON pi.person_id = p.person_id
+            GROUP BY p.person_id, p.name, p.image_url
+            ORDER BY p.name
+        """
+
+        # Fallback used when the person_images table doesn't exist yet
+        # (i.e. the migration SQL hasn't been run against this database).
+        _SIMPLE_QUERY = """
+            SELECT
+                p.person_id,
+                p.name,
+                p.image_url,
+                COUNT(DISTINCT f.id) AS face_refs,
+                COUNT(DISTINCT b.id) AS body_refs
+            FROM persons p
+            LEFT JOIN face_embeddings f ON f.person_id = p.person_id
+            LEFT JOIN body_embeddings b ON b.person_id = p.person_id
+            GROUP BY p.person_id, p.name, p.image_url
+            ORDER BY p.name
+        """
+
+        def _run_query(query: str) -> list:
+            with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query)
+                rows = []
+                for row in cur.fetchall():
+                    d = dict(row)
+                    # Always include image_urls (empty list when column absent)
+                    if "image_urls" not in d:
+                        d["image_urls"] = [d["image_url"]] if d.get("image_url") else []
+                    else:
+                        d["image_urls"] = list(d["image_urls"] or [])
+                    rows.append(d)
+                return rows
+
+        try:
+            return _run_query(_FULL_QUERY)
+        except psycopg2.errors.UndefinedTable:
+            # person_images table doesn't exist yet — the pgvector_setup.sql
+            # migration hasn't been run against this database.
+            # Roll back the aborted transaction so the connection stays usable,
+            # then retry with the simple query so the endpoint doesn't 500.
+            self._conn.rollback()
+            logger.warning(
+                "list_people: 'person_images' table not found — "
+                "run pgvector_setup.sql to enable multi-image support. "
+                "Falling back to single-image query."
             )
-            return [dict(row) for row in cur.fetchall()]
+            return _run_query(_SIMPLE_QUERY)
+        except Exception as e:
+            self._conn.rollback()
+            logger.error(f"list_people: query failed: {e}")
+            return []
 
     # ---------------------------------------------------------------- #
     # Matching
@@ -370,7 +467,7 @@ class PersonRegistry:
         with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT p.person_id, p.name,
+                SELECT p.person_id, p.name, p.image_url,
                     1 - (e.embedding <=> %s) AS similarity
                 FROM face_embeddings e
                 JOIN persons p ON p.person_id = e.person_id
@@ -391,7 +488,11 @@ class PersonRegistry:
             f"threshold={self.face_sim_threshold:.2f} -> {'MATCH' if is_match else 'no match'}"
         )
         if is_match:
-            return {"person_id": row["person_id"], "name": row["name"]}, similarity
+            return {
+                "person_id": row["person_id"],
+                "name": row["name"],
+                "image_url": row["image_url"],
+            }, similarity
         return None, similarity
 
     def match_body(
@@ -423,7 +524,7 @@ class PersonRegistry:
         with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT p.person_id, p.name,
+                SELECT p.person_id, p.name, p.image_url,
                     1 - (e.embedding <=> %s) AS similarity
                 FROM body_embeddings e
                 JOIN persons p ON p.person_id = e.person_id
@@ -451,7 +552,11 @@ class PersonRegistry:
             )
             return None, best_sim
 
-        return {"person_id": best["person_id"], "name": best["name"]}, best_sim
+        return {
+            "person_id": best["person_id"],
+            "name": best["name"],
+            "image_url": best["image_url"],
+        }, best_sim
 
     def identify(
         self,

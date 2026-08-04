@@ -302,11 +302,31 @@ class FaceRecogniser:
         else:
             start_idx = 0
 
+        h_orig, w_orig = frame.shape[:2]
+
         results: list[DetectedFace] = []
         for size in sizes[start_idx:]:
             scaled = self._resize_for_det_size(frame, size)
             results = self.detect(scaled)
             if results:
+                # Rescale bbox / landmarks back to the ORIGINAL frame's
+                # coordinate space.  detect() returns coordinates relative to
+                # `scaled`; callers (pipeline.py, annotate, …) all expect
+                # coordinates relative to the original `frame`.
+                h_sc, w_sc = scaled.shape[:2]
+                if h_sc != h_orig or w_sc != w_orig:
+                    sx = w_orig / w_sc   # x scale factor
+                    sy = h_orig / h_sc   # y scale factor
+                    for face in results:
+                        x1, y1, x2, y2 = face.bbox
+                        face.bbox = [
+                            int(x1 * sx), int(y1 * sy),
+                            int(x2 * sx), int(y2 * sy),
+                        ]
+                        face.landmarks = [
+                            [int(lx * sx), int(ly * sy)]
+                            for lx, ly in face.landmarks
+                        ]
                 break  # found faces — stop retrying
 
         return results

@@ -395,6 +395,7 @@ class SmartCityPipeline:
                     "type":       "face_watchlist_hit",
                     "person_id":  best_match["person_id"],
                     "name":       best_match["name"],
+                    "image_url":  best_match.get("image_url"),
                     "similarity": sim,
                     "frame_id":   frame_id,
                     "camera_id":  self.camera_id,
@@ -454,6 +455,7 @@ class SmartCityPipeline:
                     "type": "person_registry_hit",
                     "person_id": identity["person_id"],
                     "name": identity["name"],
+                    "image_url": identity.get("image_url"),
                     "similarity": identity["similarity"],
                     "method": identity["method"],
                     "track_id": person_det.track_id,
@@ -481,22 +483,63 @@ class SmartCityPipeline:
         if event.vehicles:
             out = self.vehicles.draw(out, event.vehicles)
 
-        for f in event.faces:
-            x1, y1, x2, y2 = f["bbox"]
-            is_alert = f["best_match"] is not None
-            color = (0, 0, 255) if is_alert else (0, 255, 0)
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            label = (f"{f['best_match']['name']} ({f['similarity']:.2f})"
-                     if is_alert else f"Unknown ({f['confidence']:.2f})")
-            cv2.putText(out, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        # ── Build a quick lookup: track_id → identity dict ────────────────────
+        # identified_people is the authoritative registry result (uses track-
+        # aggregated embeddings). We use it to label person body boxes AND to
+        # upgrade any face box that was matched here but not in the raw faces loop.
+        identity_by_track: dict[int, dict] = {
+            p["track_id"]: p for p in event.identified_people if p.get("track_id") is not None
+        }
 
+        # ── Draw person body boxes ─────────────────────────────────────────────
+        if event.persons:
+            for det in event.persons.detections:
+                x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                identity = identity_by_track.get(det.track_id)
+                if identity:
+                    # Known person — green box + name label
+                    color = (0, 220, 60)
+                    cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+                    method_tag = f"[{identity['method']}]" if identity.get("method") else ""
+                    label = f"{identity['name']} {identity['similarity']:.2f} {method_tag}"
+                    # Draw a filled background strip so text is readable
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+                    cv2.rectangle(out, (x1, y1 - th - 10), (x1 + tw + 4, y1), color, -1)
+                    cv2.putText(out, label, (x1 + 2, y1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
+                else:
+                    # Unknown person — dim grey box only (no label noise)
+                    cv2.rectangle(out, (x1, y1), (x2, y2), (120, 120, 120), 1)
+
+        # ── Draw face boxes ────────────────────────────────────────────────────
+        for f in event.faces:
+            x1, y1, x2, y2 = [int(v) for v in f["bbox"]]
+            best_match = f["best_match"]
+            sim = f["similarity"]
+
+            if best_match is not None:
+                # Face directly matched via per-frame embedding
+                color = (0, 80, 255)
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+                label = f"{best_match['name']} {sim:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 2)
+                cv2.rectangle(out, (x1, y1 - th - 10), (x1 + tw + 4, y1), color, -1)
+                cv2.putText(out, label, (x1 + 2, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
+            else:
+                # Unknown face
+                cv2.rectangle(out, (x1, y1), (x2, y2), (0, 200, 80), 1)
+                cv2.putText(out, f"? {f['confidence']:.2f}", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 80), 1)
+
+        # ── Day/Night + enhancement label ──────────────────────────────────────
         label = f"{event.day_night['label'].upper()}  {event.day_night['confidence']:.2f}"
         if event.enhanced:
             label += "  [ENHANCED]"
         cv2.putText(out, label, (10, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
         return out
+
 
     def run_stream(
         self,
