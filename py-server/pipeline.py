@@ -15,7 +15,9 @@ from services.anpr      import ANPRService, ANPRResult
 from services.dehazing  import DehazingService
 from clashifiers.person_reid.main import PersonReIdentifier
 from pg_vector import PersonRegistry
+from services.ganns import SRGANEnhancer
 import logging
+
 logger = logging.getLogger("smart_city_pipeline")
 # ─── Frame Event ──────────────────────────────────────────────────────────────
 
@@ -226,6 +228,15 @@ class SmartCityPipeline:
             f"           night_enhancement_backend={night_enhancement_backend}  "
             f"({self.enhancer.method})\n"
         )
+        self.sr_enhancer = SRGANEnhancer(
+            weights_path='weights/realesr-general-x4v3.pth',      # weights/realesr-general-x4v3.pth
+            device="cpu",
+            scale=4,    
+            min_side_trigger=260,   # skip SR for anything already >= 240p-ish
+            target_min_side=480,
+            n_threads=4,
+)
+
 
     def _maybe_downscale(self, frame: np.ndarray) -> np.ndarray:
         if self._inference_max_side <= 0:
@@ -307,7 +318,14 @@ class SmartCityPipeline:
         frame_id  = f"frame_{self._frame_idx:06d}"
         timestamp = time.time()
         identified_people = []
-
+        # frame = self.sr_enhancer.enhance(frame)
+        logger.info(
+            "SR: method=%s triggered=%s scale=%.2f frame_shape=%s",
+            self.sr_enhancer.method,
+            self.sr_enhancer.last_triggered,
+            self.sr_enhancer.last_scale_applied,
+            frame.shape,
+        )
         self._prune_track_history()
 
         dn       = self.day_night.predict(frame)
